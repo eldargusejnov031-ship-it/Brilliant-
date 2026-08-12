@@ -1,572 +1,243 @@
 import os
+import json
 import time
 import random
-import sqlite3
 import threading
-import requests
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
+import requests
 import telebot
 from telebot import types
-from flask import Flask, request
 
 
-# =========================================================
-# CONFIG
-# =========================================================
+# ============================================================
+# НАСТРОЙКИ
+# ============================================================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 HF_TOKEN = os.getenv("HF_TOKEN")
-ADMIN_IDS = {
-    int(x.strip())
-    for x in os.getenv("ADMIN_IDS", "").split(",")
-    if x.strip().isdigit()
-}
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 
-PORT = int(os.getenv("PORT", "10000"))
+DATA_FILE = "data.json"
 
 if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN не найден")
+    raise RuntimeError("BOT_TOKEN не найден в Environment Variables")
 
 if not HF_TOKEN:
-    raise RuntimeError("HF_TOKEN не найден")
+    raise RuntimeError("HF_TOKEN не найден в Environment Variables")
+
+bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
+
+db_lock = threading.Lock()
 
 
-bot = telebot.TeleBot(BOT_TOKEN)
-app = Flask(__name__)
+# ============================================================
+# БАЗА
+# ============================================================
 
-
-# =========================================================
-# DATABASE
-# =========================================================
-
-db = sqlite3.connect("bot.db", check_same_thread=False)
-db.execute("""
-CREATE TABLE IF NOT EXISTS users (
-    id INTEGER PRIMARY KEY,
-    name TEXT,
-    crystals INTEGER DEFAULT 0,
-    xp INTEGER DEFAULT 0,
-    wins INTEGER DEFAULT 0,
-    games INTEGER DEFAULT 0,
-    ai_questions INTEGER DEFAULT 0,
-    raids INTEGER DEFAULT 0,
-    last_bonus INTEGER DEFAULT 0,
-    banned INTEGER DEFAULT 0
-)
-""")
-
-db.execute("""
-CREATE TABLE IF NOT EXISTS videos (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    title TEXT NOT NULL,
-    description TEXT DEFAULT '',
-    url TEXT NOT NULL,
-    price INTEGER DEFAULT 0
-)
-""")
-
-db.execute("""
-CREATE TABLE IF NOT EXISTS tasks (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    title TEXT NOT NULL,
-    task_type TEXT NOT NULL,
-    target INTEGER NOT NULL,
-    reward INTEGER NOT NULL
-)
-""")
-
-db.execute("""
-CREATE TABLE IF NOT EXISTS task_progress (
-    user_id INTEGER,
-    task_id INTEGER,
-    progress INTEGER DEFAULT 0,
-    claimed INTEGER DEFAULT 0,
-    PRIMARY KEY(user_id, task_id)
-)
-""")
-
-db.execute("""
-CREATE TABLE IF NOT EXISTS purchases (
-    user_id INTEGER,
-    video_id INTEGER,
-    PRIMARY KEY(user_id, video_id)
-)
-""")
-
-db.execute("""
-CREATE TABLE IF NOT EXISTS promo_codes (
-    code TEXT PRIMARY KEY,
-    reward INTEGER NOT NULL,
-    uses INTEGER DEFAULT 0,
-    max_uses INTEGER DEFAULT 1
-)
-""")
-
-db.commit()
-
-
-# =========================================================
-# RUST DATA
-# =========================================================
-
-from rust_data import RAID_TARGETS, EXPLOSIVES, RUST_ITEMS
-
-
-# =========================================================
-# USER FUNCTIONS
-# =========================================================
-
-def register(user):
-    row = db.execute(
-        "SELECT id FROM users WHERE id=?",
-        (user.id,)
-    ).fetchone()
-
-    if not row:
-        db.execute(
-            "INSERT INTO users(id, name) VALUES(?, ?)",
-            (user.id, user.first_name or "Игрок")
-        )
-        db.commit()
-
-
-def get_user(user_id):
-    return db.execute(
-        """
-        SELECT id,name,crystals,xp,wins,games,
-               ai_questions,raids,last_bonus,banned
-        FROM users WHERE id=?
-        """,
-        (user_id,)
-    ).fetchone()
-
-
-def add_crystals(user_id, amount):
-    db.execute(
-        "UPDATE users SET crystals=crystals+? WHERE id=?",
-        (amount, user_id)
-    )
-    db.commit()
-
-
-def add_xp(user_id, amount):
-    db.execute(
-        "UPDATE users SET xp=xp+? WHERE id=?",
-        (amount, user_id)
-    )
-    db.commit()
-
-
-def increment(user_id, field, amount=1):
-    allowed = {
-        "wins",
-        "games",
-        "ai_questions",
-        "raids"
+def default_db():
+    return {
+        "users": {},
+        "videos": {},
+        "tasks": {
+            "daily": {
+                "name": "Зайди в бота",
+                "reward": 5
+            },
+            "activity": {
+                "name": "Сыграй 3 раза",
+                "reward": 15
+            },
+            "winner": {
+                "name": "Выиграй 5 игр",
+                "reward": 30
+            }
+        }
     }
 
-    if field not in allowed:
-        return
 
-    db.execute(
-        f"UPDATE users SET {field}={field}+? WHERE id=?",
-        (amount, user_id)
-    )
-    db.commit()
+def load_db():
+    if not os.path.exists(DATA_FILE):
+        return default_db()
 
-    update_tasks(user_id, field, amount)
+    try:
+        with open(DATA_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        base = default_db()
+
+        for key in base:
+            if key not in data:
+                data[key] = base[key]
+
+        return data
+
+    except Exception as e:
+        print("Ошибка загрузки базы:", e)
+        return default_db()
 
 
-def update_tasks(user_id, task_type, amount):
-    tasks = db.execute(
-        """
-        SELECT id,target
-        FROM tasks
-        WHERE task_type=?
-        """,
-        (task_type,)
-    ).fetchall()
+db = load_db()
 
-    for task_id, target in tasks:
 
-        row = db.execute(
-            """
-            SELECT progress,claimed
-            FROM task_progress
-            WHERE user_id=? AND task_id=?
-            """,
-            (user_id, task_id)
-        ).fetchone()
+def save_db():
+    with db_lock:
+        tmp = DATA_FILE + ".tmp"
 
-        if not row:
-            progress = 0
-            claimed = 0
-
-            db.execute(
-                """
-                INSERT INTO task_progress
-                (user_id,task_id,progress,claimed)
-                VALUES(?,?,?,?)
-                """,
-                (user_id, task_id, amount, 0)
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(
+                db,
+                f,
+                ensure_ascii=False,
+                indent=2
             )
 
-        else:
-            progress, claimed = row
+        os.replace(tmp, DATA_FILE)
 
-            if claimed:
-                continue
 
-            progress = min(progress + amount, target)
+# ============================================================
+# ПОЛЬЗОВАТЕЛИ
+# ============================================================
 
-            db.execute(
-                """
-                UPDATE task_progress
-                SET progress=?
-                WHERE user_id=? AND task_id=?
-                """,
-                (progress, user_id, task_id)
+def get_user(user_id, name=None, username=None):
+
+    uid = str(user_id)
+
+    if uid not in db["users"]:
+
+        db["users"][uid] = {
+            "id": int(user_id),
+            "name": name or "Игрок",
+            "username": username or "",
+
+            "crystals": 0,
+            "xp": 0,
+            "level": 1,
+
+            "games": 0,
+            "wins": 0,
+            "losses": 0,
+
+            "streak": 0,
+            "best_streak": 0,
+
+            "activity": 0,
+
+            "last_bonus": 0,
+
+            "completed_tasks": [],
+
+            "purchased_videos": [],
+
+            "achievements": [],
+
+            "created": int(time.time())
+        }
+
+        save_db()
+
+    user = db["users"][uid]
+
+    if name:
+        user["name"] = name
+
+    if username is not None:
+        user["username"] = username
+
+    return user
+
+
+def is_admin(user_id):
+    return ADMIN_ID != 0 and int(user_id) == ADMIN_ID
+
+
+# ============================================================
+# XP / УРОВЕНЬ
+# ============================================================
+
+def xp_for_level(level):
+    return level * 100
+
+
+def add_xp(user, amount):
+
+    user["xp"] += amount
+
+    messages = []
+
+    while user["xp"] >= xp_for_level(user["level"]):
+
+        user["xp"] -= xp_for_level(user["level"])
+        user["level"] += 1
+
+        reward = user["level"] * 5
+        user["crystals"] += reward
+
+        messages.append(
+            f"🎉 Новый уровень: <b>{user['level']}</b>!\n"
+            f"💎 Бонус: +{reward}"
+        )
+
+    return messages
+
+
+# ============================================================
+# ДОСТИЖЕНИЯ
+# ============================================================
+
+def check_achievements(user):
+
+    achievements = []
+
+    checks = [
+        ("first_game", "🎮 Первая игра", user["games"] >= 1),
+        ("first_win", "🏆 Первая победа", user["wins"] >= 1),
+        ("ten_games", "🎮 10 игр", user["games"] >= 10),
+        ("fifty_games", "🎮 50 игр", user["games"] >= 50),
+        ("ten_wins", "🏆 10 побед", user["wins"] >= 10),
+        ("hundred_xp", "⭐ 100 XP", user["level"] >= 2),
+        ("streak5", "🔥 Серия из 5", user["best_streak"] >= 5),
+    ]
+
+    for aid, name, condition in checks:
+
+        if condition and aid not in user["achievements"]:
+
+            user["achievements"].append(aid)
+            user["crystals"] += 10
+
+            achievements.append(
+                f"🏅 <b>{name}</b>\n"
+                f"💎 Награда: +10"
             )
 
-    db.commit()
+    return achievements
 
 
-def is_banned(user_id):
-    row = get_user(user_id)
-    return row and row[9] == 1
+# ============================================================
+# ГЛАВНОЕ МЕНЮ
+# ============================================================
 
+def main_keyboard(user_id):
 
-# =========================================================
-# KEYBOARDS
-# =========================================================
-
-def main_menu():
-    kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
-
-    kb.row(
-        "🔥 Rust",
-        "🤖 ИИ"
-    )
-
-    kb.row(
-        "💎 Кристаллы",
-        "🎬 Магазин"
-    )
-
-    kb.row(
-        "👤 Профиль",
-        "🏆 Рейтинг"
-    )
-
-    kb.row(
-        "🎮 Игры",
-        "🎁 Бонус"
-    )
-
-    return kb
-
-
-def rust_menu():
     kb = types.InlineKeyboardMarkup(row_width=2)
 
     kb.add(
         types.InlineKeyboardButton(
-            "💥 Рейд",
-            callback_data="raid"
+            "🤖 ИИ",
+            callback_data="ai"
         ),
         types.InlineKeyboardButton(
-            "🔨 Крафт",
-            callback_data="craft"
+            "🎮 Игры",
+            callback_data="games"
         )
     )
 
     kb.add(
         types.InlineKeyboardButton(
-            "📦 Предметы",
-            callback_data="items"
+            "💎 Кристаллы",
+            callback_data="crystals"
         ),
-        types.InlineKeyboardButton(
-            "🔎 Поиск",
-            callback_data="rust_search"
-        )
-    )
-
-    kb.add(
-        types.InlineKeyboardButton(
-            "🏠 Меню",
-            callback_data="main"
-        )
-    )
-
-    return kb
-
-
-# =========================================================
-# START
-# =========================================================
-
-@bot.message_handler(commands=["start"])
-def start(message):
-    register(message.from_user)
-
-    if is_banned(message.from_user.id):
-        bot.send_message(
-            message.chat.id,
-            "🚫 Вы заблокированы."
-        )
-        return
-
-    bot.send_message(
-        message.chat.id,
-        "🔥 Добро пожаловать в Rust Bot!\n\n"
-        "Здесь есть Rust-калькулятор, крафт, "
-        "задания, кристаллы, магазин видео и ИИ.",
-        reply_markup=main_menu()
-    )
-
-
-# =========================================================
-# RUST
-# =========================================================
-
-@bot.message_handler(func=lambda m: m.text == "🔥 Rust")
-def rust(message):
-    bot.send_message(
-        message.chat.id,
-        "🔥 RUST\n\nВыбирай:",
-        reply_markup=rust_menu()
-    )
-
-
-# =========================================================
-# RAID
-# =========================================================
-
-@bot.callback_query_handler(func=lambda c: c.data == "raid")
-def raid_menu(call):
-
-    kb = types.InlineKeyboardMarkup(row_width=2)
-
-    categories = {}
-
-    for key, item in RAID_TARGETS.items():
-        category = item.get("category", "Другое")
-        categories.setdefault(category, []).append(key)
-
-    for category in categories:
-        kb.add(
-            types.InlineKeyboardButton(
-                category,
-                callback_data=f"raidcat:{category}"
-            )
-        )
-
-    kb.add(
-        types.InlineKeyboardButton(
-            "⬅️ Назад",
-            callback_data="rust"
-        )
-    )
-
-    bot.edit_message_text(
-        "💥 РЕЙД-КАЛЬКУЛЯТОР\n\nВыбери категорию:",
-        call.message.chat.id,
-        call.message.message_id,
-        reply_markup=kb
-    )
-
-
-@bot.callback_query_handler(func=lambda c: c.data.startswith("raidcat:"))
-def raid_category(call):
-
-    category = call.data.split(":", 1)[1]
-
-    kb = types.InlineKeyboardMarkup(row_width=2)
-
-    for key, item in RAID_TARGETS.items():
-        if item.get("category", "Другое") == category:
-            kb.add(
-                types.InlineKeyboardButton(
-                    item["name"],
-                    callback_data=f"raidtarget:{key}"
-                )
-            )
-
-    kb.add(
-        types.InlineKeyboardButton(
-            "⬅️ Назад",
-            callback_data="raid"
-        )
-    )
-
-    bot.edit_message_text(
-        f"💥 {category}\n\nВыбери объект:",
-        call.message.chat.id,
-        call.message.message_id,
-        reply_markup=kb
-    )
-
-
-@bot.callback_query_handler(func=lambda c: c.data.startswith("raidtarget:"))
-def raid_target(call):
-
-    target = call.data.split(":", 1)[1]
-
-    kb = types.InlineKeyboardMarkup(row_width=2)
-
-    for key, item in EXPLOSIVES.items():
-        if key in RAID_TARGETS[target]:
-            kb.add(
-                types.InlineKeyboardButton(
-                    item["name"],
-                    callback_data=f"raidcalc:{target}:{key}"
-                )
-            )
-
-    kb.add(
-        types.InlineKeyboardButton(
-            "⬅️ Назад",
-            callback_data="raid"
-        )
-    )
-
-    bot.edit_message_text(
-        f"🎯 {RAID_TARGETS[target]['name']}\n\n"
-        "Чем будешь рейдить?",
-        call.message.chat.id,
-        call.message.message_id,
-        reply_markup=kb
-    )
-
-
-@bot.callback_query_handler(func=lambda c: c.data.startswith("raidcalc:"))
-def raid_calculate(call):
-
-    _, target, explosive = call.data.split(":")
-
-    target_data = RAID_TARGETS[target]
-    explosive_data = EXPLOSIVES[explosive]
-
-    amount = target_data[explosive]
-
-    text = (
-        "💥 РЕЗУЛЬТАТ РЕЙДА\n\n"
-        f"🎯 Цель: {target_data['name']}\n"
-        f"💣 Взрывчатка: {explosive_data['name']}\n"
-        f"📦 Нужно: {amount} шт.\n\n"
-        "🔨 РЕСУРСЫ НА КРАФТ:\n"
-    )
-
-    for resource, value in explosive_data["craft"].items():
-        text += f"• {resource}: {value * amount}\n"
-
-    increment(call.from_user.id, "raids")
-    add_xp(call.from_user.id, 3)
-
-    kb = types.InlineKeyboardMarkup()
-
-    kb.add(
-        types.InlineKeyboardButton(
-            "⬅️ Новый рейд",
-            callback_data="raid"
-        ),
-        types.InlineKeyboardButton(
-            "🏠 Меню",
-            callback_data="main"
-        )
-    )
-
-    bot.edit_message_text(
-        text,
-        call.message.chat.id,
-        call.message.message_id,
-        reply_markup=kb
-    )
-
-
-# =========================================================
-# RUST ITEMS / CRAFT
-# =========================================================
-
-@bot.callback_query_handler(
-    func=lambda c: c.data in ("items", "craft")
-)
-def items_menu(call):
-
-    kb = types.InlineKeyboardMarkup(row_width=2)
-
-    for key, item in RUST_ITEMS.items():
-        kb.add(
-            types.InlineKeyboardButton(
-                item["name"],
-                callback_data=f"item:{key}"
-            )
-        )
-
-    kb.add(
-        types.InlineKeyboardButton(
-            "⬅️ Назад",
-            callback_data="rust"
-        )
-    )
-
-    bot.edit_message_text(
-        "📦 Выбери предмет:",
-        call.message.chat.id,
-        call.message.message_id,
-        reply_markup=kb
-    )
-
-
-@bot.callback_query_handler(
-    func=lambda c: c.data.startswith("item:")
-)
-def item_info(call):
-
-    key = call.data.split(":", 1)[1]
-    item = RUST_ITEMS.get(key)
-
-    if not item:
-        return
-
-    text = (
-        f"{item['name']}\n\n"
-        f"📂 Категория: {item.get('category', 'Другое')}\n\n"
-        "🔨 КРАФТ:\n"
-    )
-
-    for resource, amount in item["craft"].items():
-        text += f"• {resource}: {amount}\n"
-
-    kb = types.InlineKeyboardMarkup()
-
-    kb.add(
-        types.InlineKeyboardButton(
-            "⬅️ Назад",
-            callback_data="items"
-        )
-    )
-
-    bot.edit_message_text(
-        text,
-        call.message.chat.id,
-        call.message.message_id,
-        reply_markup=kb
-    )
-
-
-# =========================================================
-# CRYSTALS
-# =========================================================
-
-@bot.message_handler(func=lambda m: m.text == "💎 Кристаллы")
-def crystals(message):
-
-    user = get_user(message.from_user.id)
-
-    kb = types.InlineKeyboardMarkup()
-
-    kb.add(
         types.InlineKeyboardButton(
             "🎯 Задания",
             callback_data="tasks"
@@ -575,69 +246,121 @@ def crystals(message):
 
     kb.add(
         types.InlineKeyboardButton(
-            "🎬 Магазин",
-            callback_data="shop"
+            "🎬 Видео",
+            callback_data="videos"
+        ),
+        types.InlineKeyboardButton(
+            "🏆 ТОП",
+            callback_data="top"
         )
     )
+
+    kb.add(
+        types.InlineKeyboardButton(
+            "👤 Профиль",
+            callback_data="profile"
+        ),
+        types.InlineKeyboardButton(
+            "🎁 Бонус",
+            callback_data="bonus"
+        )
+    )
+
+    if is_admin(user_id):
+        kb.add(
+            types.InlineKeyboardButton(
+                "👑 Админка",
+                callback_data="admin"
+            )
+        )
+
+    return kb
+
+
+def back_menu():
+    kb = types.InlineKeyboardMarkup()
+
+    kb.add(
+        types.InlineKeyboardButton(
+            "⬅️ Главное меню",
+            callback_data="main"
+        )
+    )
+
+    return kb
+
+
+# ============================================================
+# START
+# ============================================================
+
+@bot.message_handler(commands=["start"])
+def start(message):
+
+    user = get_user(
+        message.from_user.id,
+        message.from_user.first_name,
+        message.from_user.username
+    )
+
+    user["activity"] += 1
+
+    save_db()
 
     bot.send_message(
         message.chat.id,
-        f"💎 Твои кристаллы: {user[2]}\n\n"
-        "Выполняй задания и покупай эксклюзивные видео!",
-        reply_markup=kb
+        f"👋 <b>Привет, {user['name']}!</b>\n\n"
+        "🔥 Добро пожаловать!\n\n"
+        "Здесь тебя ждут:\n"
+        "🤖 ИИ\n"
+        "🎮 игры\n"
+        "💎 кристаллы\n"
+        "🎯 задания\n"
+        "🎬 магазин видео\n"
+        "🏆 рейтинги\n"
+        "🏅 достижения\n"
+        "🎁 ежедневные бонусы\n\n"
+        "Выбирай раздел 👇",
+        reply_markup=main_keyboard(message.from_user.id)
     )
 
 
-# =========================================================
-# TASKS
-# =========================================================
+# ============================================================
+# ИГРЫ
+# ============================================================
 
-@bot.callback_query_handler(func=lambda c: c.data == "tasks")
-def tasks(call):
+def games_keyboard():
 
-    rows = db.execute(
-        "SELECT id,title,target,reward,task_type FROM tasks"
-    ).fetchall()
+    kb = types.InlineKeyboardMarkup(row_width=2)
 
-    if not rows:
-        bot.edit_message_text(
-            "🎯 Пока нет активных заданий.",
-            call.message.chat.id,
-            call.message.message_id
+    kb.add(
+        types.InlineKeyboardButton(
+            "🪙 Монетка",
+            callback_data="game_coin"
+        ),
+        types.InlineKeyboardButton(
+            "🎲 Кубик",
+            callback_data="game_dice"
         )
-        return
+    )
 
-    text = "🎯 ЗАДАНИЯ\n\n"
-
-    kb = types.InlineKeyboardMarkup()
-
-    for task_id, title, target, reward, task_type in rows:
-
-        progress_row = db.execute(
-            """
-            SELECT progress,claimed
-            FROM task_progress
-            WHERE user_id=? AND task_id=?
-            """,
-            (call.from_user.id, task_id)
-        ).fetchone()
-
-        progress = progress_row[0] if progress_row else 0
-        claimed = progress_row[1] if progress_row else 0
-
-        text += (
-            f"🎯 {title}\n"
-            f"📊 {min(progress, target)}/{target}\n"
-            f"💎 Награда: {reward}\n\n"
+    kb.add(
+        types.InlineKeyboardButton(
+            "🔢 Угадай число",
+            callback_data="game_number"
+        ),
+        types.InlineKeyboardButton(
+            "🎰 Слоты",
+            callback_data="game_slots"
         )
+    )
 
-        if progress >= target and not claimed:
-            kb.add(
-                types.InlineKeyboardButton(
-                    f"💎 Забрать: {title[:18]}",
-                    callback_data=f"claim:{task_id}"
-                )
-            )
+    kb.add(
+        types.InlineKeyboardButton(
+            "🏆 Моя статистика",
+            callback_data="game_stats"
+        )
+    )
 
     kb.add(
         types.InlineKeyboardButton(
@@ -646,289 +369,525 @@ def tasks(call):
         )
     )
 
-    bot.edit_message_text(
-        text,
-        call.message.chat.id,
-        call.message.message_id,
-        reply_markup=kb
+    return kb
+
+
+# ============================================================
+# ИГРА: МОНЕТКА
+# ============================================================
+
+def coin_keyboard():
+
+    kb = types.InlineKeyboardMarkup()
+
+    kb.add(
+        types.InlineKeyboardButton(
+            "🦅 Орёл",
+            callback_data="coin_heads"
+        ),
+        types.InlineKeyboardButton(
+            "🪙 Решка",
+            callback_data="coin_tails"
+        )
     )
 
-
-@bot.callback_query_handler(
-    func=lambda c: c.data.startswith("claim:")
-)
-def claim_task(call):
-
-    task_id = int(call.data.split(":")[1])
-
-    task = db.execute(
-        """
-        SELECT title,target,reward
-        FROM tasks WHERE id=?
-        """,
-        (task_id,)
-    ).fetchone()
-
-    if not task:
-        return
-
-    title, target, reward = task
-
-    progress = db.execute(
-        """
-        SELECT progress,claimed
-        FROM task_progress
-        WHERE user_id=? AND task_id=?
-        """,
-        (call.from_user.id, task_id)
-    ).fetchone()
-
-    if not progress:
-        return
-
-    if progress[1] or progress[0] < target:
-        bot.answer_callback_query(
-            call.id,
-            "Награда недоступна.",
-            show_alert=True
+    kb.add(
+        types.InlineKeyboardButton(
+            "⬅️ Игры",
+            callback_data="games"
         )
-        return
-
-    db.execute(
-        """
-        UPDATE task_progress
-        SET claimed=1
-        WHERE user_id=? AND task_id=?
-        """,
-        (call.from_user.id, task_id)
     )
 
-    db.commit()
+    return kb
 
-    add_crystals(call.from_user.id, reward)
 
-    bot.answer_callback_query(
-        call.id,
-        f"+{reward} 💎"
+# ============================================================
+# ИГРА: КУБИК
+# ============================================================
+
+def dice_keyboard():
+
+    kb = types.InlineKeyboardMarkup()
+
+    kb.add(
+        types.InlineKeyboardButton(
+            "1️⃣",
+            callback_data="dice_1"
+        ),
+        types.InlineKeyboardButton(
+            "2️⃣",
+            callback_data="dice_2"
+        ),
+        types.InlineKeyboardButton(
+            "3️⃣",
+            callback_data="dice_3"
+        )
     )
 
-    tasks(call)
-
-
-# =========================================================
-# VIDEO SHOP
-# =========================================================
-
-@bot.message_handler(func=lambda m: m.text == "🎬 Магазин")
-def shop_message(message):
-    send_shop(message.chat.id)
-
-
-def send_shop(chat_id):
-
-    videos = db.execute(
-        """
-        SELECT id,title,description,price
-        FROM videos
-        ORDER BY id DESC
-        """
-    ).fetchall()
-
-    if not videos:
-        bot.send_message(
-            chat_id,
-            "🎬 Магазин пока пуст."
+    kb.add(
+        types.InlineKeyboardButton(
+            "4️⃣",
+            callback_data="dice_4"
+        ),
+        types.InlineKeyboardButton(
+            "5️⃣",
+            callback_data="dice_5"
+        ),
+        types.InlineKeyboardButton(
+            "6️⃣",
+            callback_data="dice_6"
         )
-        return
+    )
 
-    kb = types.InlineKeyboardMarkup(row_width=1)
-
-    text = "🎬 МАГАЗИН ВИДЕО\n\n"
-
-    for video_id, title, description, price in videos:
-
-        text += (
-            f"🎬 {title}\n"
-            f"{description}\n"
-            f"💎 Цена: {price}\n\n"
+    kb.add(
+        types.InlineKeyboardButton(
+            "⬅️ Игры",
+            callback_data="games"
         )
+    )
 
-        kb.add(
+    return kb
+
+
+# ============================================================
+# ИГРА: ЧИСЛО
+# ============================================================
+
+def number_keyboard():
+
+    kb = types.InlineKeyboardMarkup(row_width=3)
+
+    for i in range(1, 11):
+
+        kb.insert(
             types.InlineKeyboardButton(
-                f"💎 Купить «{title[:20]}»",
-                callback_data=f"buy:{video_id}"
+                str(i),
+                callback_data=f"number_{i}"
             )
         )
 
-    bot.send_message(
-        chat_id,
-        text,
-        reply_markup=kb
+    kb.add(
+        types.InlineKeyboardButton(
+            "⬅️ Игры",
+            callback_data="games"
+        )
     )
 
+    return kb
 
-@bot.callback_query_handler(
-    func=lambda c: c.data.startswith("buy:")
-)
-def buy_video(call):
 
-    video_id = int(call.data.split(":")[1])
+# ============================================================
+# ИГРА: СЛОТЫ
+# ============================================================
 
-    video = db.execute(
-        """
-        SELECT title,description,url,price
-        FROM videos WHERE id=?
-        """,
-        (video_id,)
-    ).fetchone()
+def slots_keyboard():
 
-    if not video:
-        return
+    kb = types.InlineKeyboardMarkup()
 
-    title, description, url, price = video
+    kb.add(
+        types.InlineKeyboardButton(
+            "🎰 Крутить!",
+            callback_data="slots_spin"
+        )
+    )
 
-    owned = db.execute(
-        """
-        SELECT 1 FROM purchases
-        WHERE user_id=? AND video_id=?
-        """,
-        (call.from_user.id, video_id)
-    ).fetchone()
+    kb.add(
+        types.InlineKeyboardButton(
+            "⬅️ Игры",
+            callback_data="games"
+        )
+    )
 
-    if owned:
-        bot.send_message(
+    return kb
+
+
+# ============================================================
+# CALLBACKS
+# ============================================================
+
+@bot.callback_query_handler(func=lambda call: True)
+def callback_handler(call):
+
+    user_id = call.from_user.id
+
+    user = get_user(
+        user_id,
+        call.from_user.first_name,
+        call.from_user.username
+    )
+
+    data = call.data
+
+    try:
+        bot.answer_callback_query(call.id)
+    except:
+        pass
+
+    # --------------------------------------------------------
+    # MAIN
+    # --------------------------------------------------------
+
+    if data == "main":
+
+        bot.edit_message_text(
+            "🏠 <b>Главное меню</b>\n\n"
+            "Выбирай раздел:",
             call.message.chat.id,
-            f"🎬 Ты уже купил «{title}»:\n{url}"
+            call.message.message_id,
+            reply_markup=main_keyboard(user_id)
         )
-        return
 
-    user = get_user(call.from_user.id)
+    # --------------------------------------------------------
+    # ИГРЫ
+    # --------------------------------------------------------
 
-    if user[2] < price:
-        bot.answer_callback_query(
-            call.id,
-            f"Не хватает {price - user[2]} 💎",
-            show_alert=True
+    elif data == "games":
+
+        bot.edit_message_text(
+            "🎮 <b>Игры</b>\n\n"
+            "Играй, получай XP и соревнуйся с другими.\n\n"
+            "💎 Здесь нет ставок на реальные деньги.",
+            call.message.chat.id,
+            call.message.message_id,
+            reply_markup=games_keyboard()
         )
-        return
 
-    db.execute(
-        """
-        UPDATE users
-        SET crystals=crystals-?
-        WHERE id=?
-        """,
-        (price, call.from_user.id)
-    )
+    # --------------------------------------------------------
+    # МОНЕТКА
+    # --------------------------------------------------------
 
-    db.execute(
-        """
-        INSERT INTO purchases(user_id,video_id)
-        VALUES(?,?)
-        """,
-        (call.from_user.id, video_id)
-    )
+    elif data == "game_coin":
 
-    db.commit()
-
-    bot.send_message(
-        call.message.chat.id,
-        f"✅ Видео «{title}» разблокировано!\n\n"
-        f"▶️ Смотреть:\n{url}"
-    )
-
-
-# =========================================================
-# PROMOCODE
-# =========================================================
-
-@bot.message_handler(commands=["promo"])
-def promo(message):
-
-    parts = message.text.split(maxsplit=1)
-
-    if len(parts) != 2:
-        bot.reply_to(
-            message,
-            "Использование:\n/promo КОД"
+        bot.edit_message_text(
+            "🪙 <b>Монетка</b>\n\n"
+            "Выбери сторону:",
+            call.message.chat.id,
+            call.message.message_id,
+            reply_markup=coin_keyboard()
         )
-        return
 
-    code = parts[1].upper()
+    elif data in ("coin_heads", "coin_tails"):
 
-    row = db.execute(
-        """
-        SELECT reward,uses,max_uses
-        FROM promo_codes
-        WHERE code=?
-        """,
-        (code,)
-    ).fetchone()
-
-    if not row:
-        bot.reply_to(
-            message,
-            "❌ Такого промокода нет."
+        choice = (
+            "heads"
+            if data == "coin_heads"
+            else "tails"
         )
-        return
 
-    reward, uses, max_uses = row
-
-    if uses >= max_uses:
-        bot.reply_to(
-            message,
-            "❌ Промокод закончился."
+        result = random.choice(
+            ["heads", "tails"]
         )
-        return
 
-    db.execute(
-        """
-        UPDATE promo_codes
-        SET uses=uses+1
-        WHERE code=?
-        """,
-        (code,)
-    )
+        user["games"] += 1
 
-    db.commit()
+        if choice == result:
 
-    add_crystals(
-        message.from_user.id,
-        reward
-    )
+            reward = random.randint(5, 12)
 
-    bot.reply_to(
-        message,
-        f"🎉 Промокод активирован!\n"
-        f"💎 +{reward}"
-    )
+            user["wins"] += 1
+            user["streak"] += 1
 
+            user["best_streak"] = max(
+                user["best_streak"],
+                user["streak"]
+            )
 
-# =========================================================
-# PROFILE
-# =========================================================
+            user["crystals"] += reward
 
-@bot.message_handler(func=lambda m: m.text == "👤 Профиль")
-def profile(message):
+            xp_messages = add_xp(user, 10)
+            achievements = check_achievements(user)
 
-    user = get_user(message.from_user.id)
+            result_text = (
+                "🎉 <b>Ты угадал!</b>\n"
+                f"💎 +{reward}\n"
+                "⭐ +10 XP"
+            )
 
-    level = user[3] // 100 + 1
+        else:
 
-    bot.send_message(
-        message.chat.id,
-        "👤 ПРОФИЛЬ\n\n"
-        f"🧑 {user[1]}\n"
-        f"⭐ Уровень: {level}\n"
-        f"✨ XP: {user[3]}\n"
-        f"💎 Кристаллы: {user[2]}\n"
-        f"🎮 Победы: {user[4]}\n"
-        f"🎲 Игр: {user[5]}\n"
-        f"🤖 Вопросов ИИ: {user[6]}\n"
-        f"💥 Рейдов рассчитано: {user[7]}"
-    )
+            user["losses"] += 1
+            user["streak"] = 0
 
+            add_xp(user, 3)
+            achievements = check_achievements(user)
 
-# =========================================================
-# RATING
-# =====================================
+            result_text = (
+                "😅 Не угадал!\n"
+                "⭐ +3 XP за игру"
+            )
+
+        save_db()
+
+        bot.edit_message_text(
+            "🪙 <b>Монетка</b>\n\n"
+            f"Твой выбор: "
+            f"{'🦅 Орёл' if choice == 'heads' else '🪙 Решка'}\n"
+            f"Выпало: "
+            f"{'🦅 Орёл' if result == 'heads' else '🪙 Решка'}\n\n"
+            f"{result_text}\n\n"
+            f"💎 Баланс: {user['crystals']}\n"
+            f"🔥 Серия: {user['streak']}",
+            call.message.chat.id,
+            call.message.message_id,
+            reply_markup=coin_keyboard()
+        )
+
+    # --------------------------------------------------------
+    # КУБИК
+    # --------------------------------------------------------
+
+    elif data == "game_dice":
+
+        bot.edit_message_text(
+            "🎲 <b>Угадай число</b>\n\n"
+            "Какое число выпадет?",
+            call.message.chat.id,
+            call.message.message_id,
+            reply_markup=dice_keyboard()
+        )
+
+    elif data.startswith("dice_"):
+
+        chosen = int(data.split("_")[1])
+        result = random.randint(1, 6)
+
+        user["games"] += 1
+
+        if chosen == result:
+
+            reward = 15
+
+            user["wins"] += 1
+            user["streak"] += 1
+            user["best_streak"] = max(
+                user["best_streak"],
+                user["streak"]
+            )
+
+            user["crystals"] += reward
+
+            add_xp(user, 15)
+
+            text = (
+                "🎉 <b>Точно!</b>\n\n"
+                f"🎲 Выпало: <b>{result}</b>\n"
+                f"💎 +{reward}"
+            )
+
+        else:
+
+            user["losses"] += 1
+            user["streak"] = 0
+
+            add_xp(user, 3)
+
+            text = (
+                "😅 Не угадал!\n\n"
+                f"🎲 Выпало: <b>{result}</b>\n"
+                "⭐ +3 XP"
+            )
+
+        check_achievements(user)
+        save_db()
+
+        bot.edit_message_text(
+            text +
+            f"\n\n💎 Баланс: {user['crystals']}",
+            call.message.chat.id,
+            call.message.message_id,
+            reply_markup=dice_keyboard()
+        )
+
+    # --------------------------------------------------------
+    # ЧИСЛО
+    # --------------------------------------------------------
+
+    elif data == "game_number":
+
+        user["number_game"] = random.randint(1, 10)
+        save_db()
+
+        bot.edit_message_text(
+            "🔢 <b>Угадай число</b>\n\n"
+            "Я загадал число от 1 до 10.\n"
+            "Попробуй угадать:",
+            call.message.chat.id,
+            call.message.message_id,
+            reply_markup=number_keyboard()
+        )
+
+    elif data.startswith("number_"):
+
+        chosen = int(data.split("_")[1])
+
+        secret = user.get(
+            "number_game",
+            random.randint(1, 10)
+        )
+
+        user["games"] += 1
+
+        if chosen == secret:
+
+            reward = 20
+
+            user["wins"] += 1
+            user["streak"] += 1
+            user["best_streak"] = max(
+                user["best_streak"],
+                user["streak"]
+            )
+
+            user["crystals"] += reward
+
+            add_xp(user, 20)
+
+            text = (
+                "🎯 <b>Ты угадал!</b>\n\n"
+                f"🔢 Число: <b>{secret}</b>\n"
+                f"💎 +{reward}\n"
+                "⭐ +20 XP"
+            )
+
+        else:
+
+            user["losses"] += 1
+            user["streak"] = 0
+
+            add_xp(user, 3)
+
+            text = (
+                "❌ Не угадал!\n\n"
+                f"Я загадал: <b>{secret}</b>\n"
+                "⭐ +3 XP"
+            )
+
+        user.pop("number_game", None)
+
+        check_achievements(user)
+        save_db()
+
+        bot.edit_message_text(
+            text,
+            call.message.chat.id,
+            call.message.message_id,
+            reply_markup=number_keyboard()
+        )
+
+    # --------------------------------------------------------
+    # СЛОТЫ
+    # --------------------------------------------------------
+
+    elif data == "game_slots":
+
+        bot.edit_message_text(
+            "🎰 <b>Слоты</b>\n\n"
+            "Нажми кнопку и посмотри комбинацию!",
+            call.message.chat.id,
+            call.message.message_id,
+            reply_markup=slots_keyboard()
+        )
+
+    elif data == "slots_spin":
+
+        symbols = [
+            "🍒",
+            "🍋",
+            "🍉",
+            "⭐",
+            "7️⃣"
+        ]
+
+        a = random.choice(symbols)
+        b = random.choice(symbols)
+        c = random.choice(symbols)
+
+        user["games"] += 1
+
+        if a == b == c:
+
+            reward = 50
+
+            user["wins"] += 1
+            user["streak"] += 1
+
+            user["best_streak"] = max(
+                user["best_streak"],
+                user["streak"]
+            )
+
+            user["crystals"] += reward
+
+            add_xp(user, 25)
+
+            result = (
+                "🔥 <b>ДЖЕКПОТ!</b>\n"
+                f"💎 +{reward}"
+            )
+
+        elif a == b or b == c or a == c:
+
+            reward = 10
+
+            user["wins"] += 1
+            user["streak"] += 1
+            user["crystals"] += reward
+
+            add_xp(user, 10)
+
+            result = (
+                "✨ <b>Совпадение!</b>\n"
+                f"💎 +{reward}"
+            )
+
+        else:
+
+            user["losses"] += 1
+            user["streak"] = 0
+
+            add_xp(user, 3)
+
+            result = "😅 В этот раз мимо.\n⭐ +3 XP"
+
+        check_achievements(user)
+        save_db()
+
+        bot.edit_message_text(
+            "🎰 <b>СЛОТЫ</b>\n\n"
+            f"│ {a} │ {b} │ {c} │\n\n"
+            f"{result}\n\n"
+            f"💎 Баланс: {user['crystals']}",
+            call.message.chat.id,
+            call.message.message_id,
+            reply_markup=slots_keyboard()
+        )
+
+    # --------------------------------------------------------
+    # СТАТИСТИКА ИГР
+    # --------------------------------------------------------
+
+    elif data == "game_stats":
+
+        bot.edit_message_text(
+            "📊 <b>Игровая статистика</b>\n\n"
+            f"🎮 Игр: {user['games']}\n"
+            f"🏆 Побед: {user['wins']}\n"
+            f"❌ Поражений: {user['losses']}\n"
+            f"🔥 Текущая серия: {user['streak']}\n"
+            f"🔥 Лучшая серия: {user['best_streak']}\n"
+            f"⭐ Уровень: {user['level']}\n"
+            f"✨ XP: {user['xp']}",
+            call.message.chat.id,
+            call.message.message_id,
+            reply_markup=back_menu()
+        )
+
+    # --------------------------------------------------------
+    # ПРОФИЛЬ
+    # --------------------------------------------------------
+
+    elif data == "profile":
+
+        achievements = len(user["achievements"])
+
+        bot.edit
