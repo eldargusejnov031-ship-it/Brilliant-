@@ -9,69 +9,116 @@ from telegram.ext import (
     CallbackQueryHandler,
     MessageHandler,
     ContextTypes,
-    filters
+    filters,
 )
 
 
 # =========================================================
-# ТОКЕНЫ
+# НАСТРОЙКИ
 # =========================================================
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 HF_TOKEN = os.environ.get("HF_TOKEN")
 
-
-# =========================================================
-# HUGGING FACE
-# =========================================================
-
-API_URL = "https://router.huggingface.co/v1/chat/completions"
-MODEL = "openai/gpt-oss-120b:groq"
+HF_URL = "https://router.huggingface.co/v1/chat/completions"
+HF_MODEL = "openai/gpt-oss-120b:groq"
 
 
 # =========================================================
-# ИИ
+# ДАННЫЕ RUST
 # =========================================================
 
-def ask_ai(question):
+ITEMS = {
+    "wood_door": {
+        "name": "🪵 Деревянная дверь",
+        "category": "Двери",
+        "health": "200 HP",
+        "craft": {
+            "Дерево": 300
+        },
+    },
 
-    headers = {
-        "Authorization": f"Bearer {HF_TOKEN}",
-        "Content-Type": "application/json"
-    }
+    "sheet_door": {
+        "name": "🔩 Металлическая дверь",
+        "category": "Двери",
+        "health": "250 HP",
+        "craft": {
+            "Фрагменты металла": 150
+        },
+    },
 
-    data = {
-        "model": MODEL,
-        "messages": [
-            {
-                "role": "system",
-                "content": (
-                    "Ты дружелюбный ИИ-помощник по игре Rust. "
-                    "Отвечай на русском языке."
-                )
-            },
-            {
-                "role": "user",
-                "content": question
-            }
-        ],
-        "max_tokens": 1000
-    }
+    "garage_door": {
+        "name": "🚗 Гаражная дверь",
+        "category": "Двери",
+        "health": "600 HP",
+        "craft": {
+            "Фрагменты металла": 300,
+            "Шестерёнки": 2,
+        },
+    },
 
-    response = requests.post(
-        API_URL,
-        headers=headers,
-        json=data,
-        timeout=60
-    )
+    "armored_door": {
+        "name": "🛡 МВК дверь",
+        "category": "Двери",
+        "health": "800 HP",
+        "craft": {
+            "Металл высокого качества": 20,
+        },
+    },
 
-    if response.status_code != 200:
-        print(response.text)
-        raise Exception("Ошибка Hugging Face")
+    "wood_wall": {
+        "name": "🪵 Деревянная стена",
+        "category": "Стены",
+        "health": "250 HP",
+        "craft": {
+            "Дерево": 100,
+        },
+    },
 
-    result = response.json()
+    "stone_wall": {
+        "name": "🪨 Каменная стена",
+        "category": "Стены",
+        "health": "500 HP",
+        "craft": {
+            "Камень": 300,
+        },
+    },
 
-    return result["choices"][0]["message"]["content"]
+    "metal_wall": {
+        "name": "🔩 Металлическая стена",
+        "category": "Стены",
+        "health": "1000 HP",
+        "craft": {
+            "Фрагменты металла": 200,
+        },
+    },
+
+    "armored_wall": {
+        "name": "🛡 МВК стена",
+        "category": "Стены",
+        "health": "2000 HP",
+        "craft": {
+            "Металл высокого качества": 25,
+        },
+    },
+}
+
+
+# =========================================================
+# ВСПОМОГАТЕЛЬНЫЕ КНОПКИ
+# =========================================================
+
+def button(text, callback):
+    return InlineKeyboardButton(text, callback_data=callback)
+
+
+def navigation(back="rust"):
+    return [
+        [
+            button("⬅️ Назад", back),
+            button("🏠 Меню", "home"),
+        ]
+    ]
 
 
 # =========================================================
@@ -79,29 +126,11 @@ def ask_ai(question):
 # =========================================================
 
 def main_menu():
-
-    keyboard = [
-        [
-            InlineKeyboardButton(
-                "🎮 RUST",
-                callback_data="rust"
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "🤖 ИИ-помощник",
-                callback_data="ai"
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "ℹ️ О боте",
-                callback_data="about"
-            )
-        ]
-    ]
-
-    return InlineKeyboardMarkup(keyboard)
+    return InlineKeyboardMarkup([
+        [button("🎮 RUST", "rust")],
+        [button("🤖 ИИ-помощник", "ai")],
+        [button("ℹ️ О боте", "about")],
+    ])
 
 
 # =========================================================
@@ -109,47 +138,13 @@ def main_menu():
 # =========================================================
 
 def rust_menu():
-
-    keyboard = [
-        [
-            InlineKeyboardButton(
-                "💥 Рейд",
-                callback_data="raid"
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "🧱 Строительство",
-                callback_data="building"
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "🚪 Двери",
-                callback_data="doors"
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "🔨 Крафт",
-                callback_data="craft"
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "📖 Справочник",
-                callback_data="guide"
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "⬅️ Назад",
-                callback_data="home"
-            )
-        ]
-    ]
-
-    return InlineKeyboardMarkup(keyboard)
+    return InlineKeyboardMarkup([
+        [button("💥 Рейд", "raid")],
+        [button("🔨 Крафт", "craft")],
+        [button("🏗 Строительство", "building")],
+        [button("📖 Справочник", "guide")],
+        [button("🏠 Главное меню", "home")],
+    ])
 
 
 # =========================================================
@@ -157,131 +152,67 @@ def rust_menu():
 # =========================================================
 
 def raid_menu():
-
-    keyboard = [
-        [
-            InlineKeyboardButton(
-                "🪵 Деревянная стена",
-                callback_data="raid_wood"
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "🪨 Каменная стена",
-                callback_data="raid_stone"
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "🔩 Металлическая стена",
-                callback_data="raid_metal"
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "🛡 Бронированная стена",
-                callback_data="raid_hq"
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "🚪 Двери",
-                callback_data="raid_doors"
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "⬅️ Назад",
-                callback_data="rust"
-            )
-        ]
-    ]
-
-    return InlineKeyboardMarkup(keyboard)
+    return InlineKeyboardMarkup([
+        [button("🚪 Двери", "raid_doors")],
+        [button("🧱 Стены", "raid_walls")],
+        [button("🪟 Окна", "raid_windows")],
+        [button("🛡 Решётки", "raid_bars")],
+        *navigation("rust"),
+    ])
 
 
 # =========================================================
-# МЕНЮ ДВЕРЕЙ В РЕЙДЕ
+# ДВЕРИ
 # =========================================================
 
-def raid_doors_menu():
-
-    keyboard = [
-        [
-            InlineKeyboardButton(
-                "🚪 Деревянная дверь",
-                callback_data="door_wood"
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "🔩 Металлическая дверь",
-                callback_data="door_metal"
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "🚗 Гаражная дверь",
-                callback_data="door_garage"
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "🛡 Бронированная дверь",
-                callback_data="door_hq"
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "⬅️ Назад",
-                callback_data="raid"
-            )
-        ]
-    ]
-
-    return InlineKeyboardMarkup(keyboard)
+def doors_menu():
+    return InlineKeyboardMarkup([
+        [button("🪵 Деревянная дверь", "item_wood_door")],
+        [button("🔩 Металлическая дверь", "item_sheet_door")],
+        [button("🚗 Гаражная дверь", "item_garage_door")],
+        [button("🛡 МВК дверь", "item_armored_door")],
+        *navigation("raid"),
+    ])
 
 
 # =========================================================
-# СТРОИТЕЛЬСТВО
+# СТЕНЫ
 # =========================================================
 
-def building_menu():
+def walls_menu():
+    return InlineKeyboardMarkup([
+        [button("🪵 Деревянная стена", "item_wood_wall")],
+        [button("🪨 Каменная стена", "item_stone_wall")],
+        [button("🔩 Металлическая стена", "item_metal_wall")],
+        [button("🛡 МВК стена", "item_armored_wall")],
+        *navigation("raid"),
+    ])
 
-    keyboard = [
-        [
-            InlineKeyboardButton(
-                "🧱 Фундаменты",
-                callback_data="foundations"
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "🧱 Стены",
-                callback_data="walls"
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "🔲 Потолки",
-                callback_data="ceilings"
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "🪟 Проёмы",
-                callback_data="openings"
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "⬅️ Назад",
-                callback_data="rust"
-            )
-        ]
-    ]
 
-    return InlineKeyboardMarkup(keyboard)
+# =========================================================
+# ОКНА
+# =========================================================
+
+def windows_menu():
+    return InlineKeyboardMarkup([
+        [button("🪵 Деревянный проём", "window_wood")],
+        [button("🪨 Каменный проём", "window_stone")],
+        [button("🔩 Металлический проём", "window_metal")],
+        [button("🛡 МВК проём", "window_armored")],
+        *navigation("raid"),
+    ])
+
+
+# =========================================================
+# РЕШЁТКИ
+# =========================================================
+
+def bars_menu():
+    return InlineKeyboardMarkup([
+        [button("🔩 Металлическая решётка", "bars_metal")],
+        [button("🛡 Усиленная решётка", "bars_armored")],
+        *navigation("raid"),
+    ])
 
 
 # =========================================================
@@ -289,71 +220,120 @@ def building_menu():
 # =========================================================
 
 def craft_menu():
-
-    keyboard = [
-        [
-            InlineKeyboardButton(
-                "⛏ Ресурсы",
-                callback_data="resources"
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "🔨 Инструменты",
-                callback_data="tools"
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "🔫 Оружие",
-                callback_data="weapons"
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "🏠 Строительство",
-                callback_data="building"
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "⬅️ Назад",
-                callback_data="rust"
-            )
-        ]
-    ]
-
-    return InlineKeyboardMarkup(keyboard)
+    return InlineKeyboardMarkup([
+        [button("⛏ Ресурсы", "resources")],
+        [button("🔨 Инструменты", "tools")],
+        [button("🔫 Оружие", "weapons")],
+        [button("🏠 Строительство", "building")],
+        *navigation("rust"),
+    ])
 
 
 # =========================================================
-# /START
+# СТРОИТЕЛЬСТВО
+# =========================================================
+
+def building_menu():
+    return InlineKeyboardMarkup([
+        [button("🧱 Фундаменты", "foundations")],
+        [button("🧱 Стены", "raid_walls")],
+        [button("🔲 Потолки", "ceilings")],
+        [button("🪟 Проёмы", "raid_windows")],
+        *navigation("rust"),
+    ])
+
+
+# =========================================================
+# ПОКАЗ ПРЕДМЕТА
+# =========================================================
+
+def item_keyboard(item_id):
+    return InlineKeyboardMarkup([
+        [
+            button("➕ Количество", f"qty_{item_id}")
+        ],
+        [
+            button("🔨 Крафт", f"craft_item_{item_id}")
+        ],
+        [
+            button("⬅️ Назад", "raid"),
+            button("🏠 Меню", "home"),
+        ]
+    ])
+
+
+def item_text(item_id):
+    item = ITEMS[item_id]
+
+    text = (
+        f"{item['name']}\n\n"
+        f"📂 Категория: {item['category']}\n"
+        f"❤️ Прочность: {item['health']}\n\n"
+        f"🔨 Рецепт крафта:\n"
+    )
+
+    for resource, amount in item["craft"].items():
+        text += f"• {resource}: {amount}\n"
+
+    text += "\nВыбери действие ниже."
+
+    return text
+
+
+# =========================================================
+# КОЛИЧЕСТВО
+# =========================================================
+
+def quantity_menu(item_id):
+    return InlineKeyboardMarkup([
+        [
+            button("1", f"calc_{item_id}_1"),
+            button("2", f"calc_{item_id}_2"),
+            button("5", f"calc_{item_id}_5"),
+        ],
+        [
+            button("10", f"calc_{item_id}_10"),
+            button("20", f"calc_{item_id}_20"),
+        ],
+        [
+            button("⬅️ Назад", f"item_{item_id}"),
+            button("🏠 Меню", "home"),
+        ],
+    ])
+
+
+# =========================================================
+# КАЛЬКУЛЯТОР КРАФТА
+# =========================================================
+
+def calculate_craft(item_id, quantity):
+    item = ITEMS[item_id]
+
+    text = (
+        f"🧮 КАЛЬКУЛЯТОР КРАФТА\n\n"
+        f"{item['name']}\n"
+        f"Количество: {quantity}\n\n"
+        f"📦 Всего понадобится:\n"
+    )
+
+    for resource, amount in item["craft"].items():
+        total = amount * quantity
+        text += f"• {resource}: {total}\n"
+
+    return text
+
+
+# =========================================================
+# START
 # =========================================================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(
         "👋 Привет!\n\n"
-        "🤖 Я твой ИИ-помощник по Rust.\n\n"
-        "Выбирай нужный раздел:",
+        "🤖 Я помощник по Rust.\n\n"
+        "Выбери нужный раздел:",
         reply_markup=main_menu()
-    )
-
-
-# =========================================================
-# /HELP
-# =========================================================
-
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
-    await update.message.reply_text(
-        "❓ Помощь\n\n"
-        "🎮 RUST — информация об игре\n"
-        "💥 Рейд — справочник построек\n"
-        "🧱 Строительство — элементы строительства\n"
-        "🚪 Двери — виды дверей\n"
-        "🔨 Крафт — предметы и ресурсы\n"
-        "🤖 ИИ — задавай вопросы"
     )
 
 
@@ -370,24 +350,20 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = query.data
 
 
-    # =========================
-    # ГЛАВНОЕ
-    # =========================
-
+    # Главное меню
     if data == "home":
 
         await query.edit_message_text(
-            "🏠 Главное меню\n\n"
-            "Выбирай раздел:",
+            "🏠 ГЛАВНОЕ МЕНЮ\n\n"
+            "Выбери раздел:",
             reply_markup=main_menu()
         )
 
+        return
 
-    # =========================
+
     # RUST
-    # =========================
-
-    elif data == "rust":
+    if data == "rust":
 
         await query.edit_message_text(
             "🎮 RUST\n\n"
@@ -395,180 +371,127 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=rust_menu()
         )
 
+        return
 
-    # =========================
+
     # РЕЙД
-    # =========================
-
-    elif data == "raid":
+    if data == "raid":
 
         await query.edit_message_text(
             "💥 РЕЙД\n\n"
-            "Выбери объект:",
+            "Выбери категорию:",
             reply_markup=raid_menu()
         )
 
-
-    elif data == "raid_wood":
-
-        await query.edit_message_text(
-            "🪵 ДЕРЕВЯННАЯ СТЕНА\n\n"
-            "Тип: строительный элемент\n"
-            "Материал: дерево\n\n"
-            "Используется для ранних построек.\n\n"
-            "ℹ️ Здесь можно посмотреть "
-            "характеристики объекта.",
-            reply_markup=raid_menu()
-        )
+        return
 
 
-    elif data == "raid_stone":
-
-        await query.edit_message_text(
-            "🪨 КАМЕННАЯ СТЕНА\n\n"
-            "Тип: строительный элемент\n"
-            "Материал: камень\n\n"
-            "Более прочный вариант стены "
-            "по сравнению с деревянной.",
-            reply_markup=raid_menu()
-        )
-
-
-    elif data == "raid_metal":
-
-        await query.edit_message_text(
-            "🔩 МЕТАЛЛИЧЕСКАЯ СТЕНА\n\n"
-            "Тип: строительный элемент\n"
-            "Материал: металл\n\n"
-            "Используется для усиленной защиты базы.",
-            reply_markup=raid_menu()
-        )
-
-
-    elif data == "raid_hq":
-
-        await query.edit_message_text(
-            "🛡 БРОНИРОВАННАЯ СТЕНА\n\n"
-            "Тип: строительный элемент\n"
-            "Материал: высококачественный металл\n\n"
-            "Один из самых прочных вариантов "
-            "строительства.",
-            reply_markup=raid_menu()
-        )
-
-
-    # =========================
     # ДВЕРИ
-    # =========================
-
-    elif data == "raid_doors":
+    if data == "raid_doors":
 
         await query.edit_message_text(
             "🚪 ДВЕРИ\n\n"
-            "Выбери тип двери:",
-            reply_markup=raid_doors_menu()
+            "Выбери дверь:",
+            reply_markup=doors_menu()
         )
 
-
-    elif data == "door_wood":
-
-        await query.edit_message_text(
-            "🚪 ДЕРЕВЯННАЯ ДВЕРЬ\n\n"
-            "Материал: дерево\n"
-            "Тип: дверь\n\n"
-            "Подходит для ранних этапов игры.",
-            reply_markup=raid_doors_menu()
-        )
+        return
 
 
-    elif data == "door_metal":
-
-        await query.edit_message_text(
-            "🔩 МЕТАЛЛИЧЕСКАЯ ДВЕРЬ\n\n"
-            "Материал: металл\n"
-            "Тип: дверь\n\n"
-            "Используется для усиленной защиты.",
-            reply_markup=raid_doors_menu()
-        )
-
-
-    elif data == "door_garage":
-
-        await query.edit_message_text(
-            "🚗 ГАРАЖНАЯ ДВЕРЬ\n\n"
-            "Тип: гаражная дверь\n"
-            "Используется в больших базах.",
-            reply_markup=raid_doors_menu()
-        )
-
-
-    elif data == "door_hq":
-
-        await query.edit_message_text(
-            "🛡 БРОНИРОВАННАЯ ДВЕРЬ\n\n"
-            "Тип: бронированная дверь\n"
-            "Материал: высококачественный металл.",
-            reply_markup=raid_doors_menu()
-        )
-
-
-    # =========================
-    # СТРОИТЕЛЬСТВО
-    # =========================
-
-    elif data == "building":
-
-        await query.edit_message_text(
-            "🧱 СТРОИТЕЛЬСТВО\n\n"
-            "Выбери категорию:",
-            reply_markup=building_menu()
-        )
-
-
-    elif data == "foundations":
-
-        await query.edit_message_text(
-            "🧱 ФУНДАМЕНТЫ\n\n"
-            "Основные элементы основания базы.",
-            reply_markup=building_menu()
-        )
-
-
-    elif data == "walls":
+    # СТЕНЫ
+    if data == "raid_walls":
 
         await query.edit_message_text(
             "🧱 СТЕНЫ\n\n"
-            "🪵 Дерево\n"
-            "🪨 Камень\n"
-            "🔩 Металл\n"
-            "🛡 Бронированная",
-            reply_markup=building_menu()
+            "Выбери стену:",
+            reply_markup=walls_menu()
         )
 
+        return
 
-    elif data == "ceilings":
+
+    # ОКНА
+    if data == "raid_windows":
 
         await query.edit_message_text(
-            "🔲 ПОТОЛКИ\n\n"
-            "Элементы верхней части строительной конструкции.",
-            reply_markup=building_menu()
+            "🪟 ОКНА И ПРОЁМЫ\n\n"
+            "Выбери объект:",
+            reply_markup=windows_menu()
         )
 
+        return
 
-    elif data == "openings":
+
+    # РЕШЁТКИ
+    if data == "raid_bars":
 
         await query.edit_message_text(
-            "🪟 ПРОЁМЫ\n\n"
-            "Дверные и оконные проёмы.",
-            reply_markup=building_menu()
+            "🛡 РЕШЁТКИ\n\n"
+            "Выбери объект:",
+            reply_markup=bars_menu()
         )
 
+        return
 
-    # =========================
+
+    # ПРЕДМЕТЫ
+    if data.startswith("item_"):
+
+        item_id = data.replace("item_", "")
+
+        if item_id in ITEMS:
+
+            await query.edit_message_text(
+                item_text(item_id),
+                reply_markup=item_keyboard(item_id)
+            )
+
+            return
+
+
+    # КОЛИЧЕСТВО
+    if data.startswith("qty_"):
+
+        item_id = data.replace("qty_", "")
+
+        if item_id in ITEMS:
+
+            await query.edit_message_text(
+                "🧮 Выбери количество:",
+                reply_markup=quantity_menu(item_id)
+            )
+
+            return
+
+
+    # РАСЧЁТ
+    if data.startswith("calc_"):
+
+        parts = data.split("_")
+
+        item_id = "_".join(parts[1:-1])
+        quantity = int(parts[-1])
+
+        if item_id in ITEMS:
+
+            await query.edit_message_text(
+                calculate_craft(item_id, quantity),
+                reply_markup=InlineKeyboardMarkup([
+                    [
+                        button("🔄 Ещё раз", f"qty_{item_id}")
+                    ],
+                    [
+                        button("⬅️ Назад", f"item_{item_id}"),
+                        button("🏠 Меню", "home"),
+                    ]
+                ])
+            )
+
+            return
+
+
     # КРАФТ
-    # =========================
-
-    elif data == "craft":
+    if data == "craft":
 
         await query.edit_message_text(
             "🔨 КРАФТ\n\n"
@@ -576,8 +499,10 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=craft_menu()
         )
 
+        return
 
-    elif data == "resources":
+
+    if data == "resources":
 
         await query.edit_message_text(
             "⛏ РЕСУРСЫ\n\n"
@@ -588,105 +513,229 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=craft_menu()
         )
 
+        return
 
-    elif data == "tools":
+
+    if data == "tools":
 
         await query.edit_message_text(
             "🔨 ИНСТРУМЕНТЫ\n\n"
-            "Кирки, топоры и другие инструменты.",
+            "Кирка\n"
+            "Каменный топор\n"
+            "Металлическая кирка\n"
+            "Металлический топор",
             reply_markup=craft_menu()
         )
 
+        return
 
-    elif data == "weapons":
+
+    if data == "weapons":
 
         await query.edit_message_text(
             "🔫 ОРУЖИЕ\n\n"
-            "Справочная информация об оружии Rust.",
+            "Здесь будет справочник оружия Rust.",
             reply_markup=craft_menu()
         )
 
+        return
 
-    # =========================
+
+    # СТРОИТЕЛЬСТВО
+    if data == "building":
+
+        await query.edit_message_text(
+            "🏗 СТРОИТЕЛЬСТВО\n\n"
+            "Выбери раздел:",
+            reply_markup=building_menu()
+        )
+
+        return
+
+
+    if data == "foundations":
+
+        await query.edit_message_text(
+            "🧱 ФУНДАМЕНТЫ\n\n"
+            "Основные элементы строительства базы.",
+            reply_markup=building_menu()
+        )
+
+        return
+
+
+    if data == "ceilings":
+
+        await query.edit_message_text(
+            "🔲 ПОТОЛКИ\n\n"
+            "Элементы верхней части базы.",
+            reply_markup=building_menu()
+        )
+
+        return
+
+
     # СПРАВОЧНИК
-    # =========================
-
-    elif data == "guide":
+    if data == "guide":
 
         await query.edit_message_text(
             "📖 СПРАВОЧНИК RUST\n\n"
-            "Здесь будет информация об игровых "
-            "предметах, постройках, ресурсах "
-            "и механиках.",
+            "Здесь находятся игровые характеристики,\n"
+            "ресурсы и рецепты.",
             reply_markup=rust_menu()
         )
 
+        return
 
-    # =========================
+
     # ИИ
-    # =========================
-
-    elif data == "ai":
+    if data == "ai":
 
         await query.edit_message_text(
             "🤖 ИИ-ПОМОЩНИК\n\n"
-            "Просто напиши сообщение в чат, "
-            "и я отвечу.",
-            reply_markup=main_menu()
+            "Напиши мне любой вопрос сообщением.\n\n"
+            "Например:\n"
+            "«Как работает верстак в Rust?»",
+            reply_markup=InlineKeyboardMarkup([
+                [
+                    button("🏠 Меню", "home")
+                ]
+            ])
         )
 
+        return
 
-    # =========================
+
     # О БОТЕ
-    # =========================
-
-    elif data == "about":
+    if data == "about":
 
         await query.edit_message_text(
             "🤖 RUST AI BOT\n\n"
-            "Помощник по игре Rust.\n\n"
-            "🎮 Меню Rust\n"
-            "📖 Справочник\n"
-            "🔨 Крафт\n"
-            "🤖 ИИ-помощник",
-            reply_markup=main_menu()
+            "Помощник по Rust с меню,\n"
+            "справочником и ИИ.",
+            reply_markup=InlineKeyboardMarkup([
+                [
+                    button("🏠 Меню", "home")
+                ]
+            ])
         )
 
+        return
+
+
+    # ОКНА
+    if data.startswith("window_"):
+
+        await query.edit_message_text(
+            "🪟 ОБЪЕКТ\n\n"
+            "Справочная информация об элементе "
+            "строительства.",
+            reply_markup=windows_menu()
+        )
+
+        return
+
+
+    # РЕШЁТКИ
+    if data.startswith("bars_"):
+
+        await query.edit_message_text(
+            "🛡 РЕШЁТКА\n\n"
+            "Справочная информация об элементе "
+            "строительства.",
+            reply_markup=bars_menu()
+        )
+
+        return
+
 
 # =========================================================
-# СООБЩЕНИЯ
+# ИИ
 # =========================================================
 
-async def ai_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+def ask_ai(question):
+
+    headers = {
+        "Authorization": f"Bearer {HF_TOKEN}",
+        "Content-Type": "application/json",
+    }
+
+    payload = {
+        "model": HF_MODEL,
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "Ты дружелюбный помощник по Rust. "
+                    "Отвечай на русском языке."
+                ),
+            },
+            {
+                "role": "user",
+                "content": question,
+            },
+        ],
+        "max_tokens": 1000,
+    }
+
+    response = requests.post(
+        HF_URL,
+        headers=headers,
+        json=payload,
+        timeout=60,
+    )
+
+    if response.status_code != 200:
+        raise Exception(
+            f"Hugging Face HTTP {response.status_code}: "
+            f"{response.text}"
+        )
+
+    result = response.json()
+
+    return result["choices"][0]["message"]["content"]
+
+
+# =========================================================
+# СООБЩЕНИЯ ДЛЯ ИИ
+# =========================================================
+
+async def ai_message(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
 
     question = update.message.text
 
-    await update.message.chat.send_action("typing")
-
     try:
+
+        await update.message.chat.send_action("typing")
 
         answer = await asyncio.to_thread(
             ask_ai,
             question
         )
 
-        if len(answer) > 4000:
+        if len(answer) <= 4000:
+
+            await update.message.reply_text(answer)
+
+        else:
 
             for i in range(0, len(answer), 4000):
+
                 await update.message.reply_text(
                     answer[i:i + 4000]
                 )
 
-        else:
-
-            await update.message.reply_text(answer)
-
     except Exception as error:
 
-        print("ОШИБКА ИИ:", error)
+        print("ОШИБКА ИИ:")
+        print(error)
 
         await update.message.reply_text(
-            "❌ Не удалось получить ответ от ИИ."
+            "❌ ИИ временно не смог ответить.\n\n"
+            "Проверь HF_TOKEN и попробуй ещё раз."
         )
 
 
@@ -697,10 +746,12 @@ async def ai_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
 
     if not TELEGRAM_TOKEN:
-        raise Exception("TELEGRAM_TOKEN не задан")
+        print("❌ TELEGRAM_TOKEN не найден.")
+        return
 
     if not HF_TOKEN:
-        raise Exception("HF_TOKEN не задан")
+        print("❌ HF_TOKEN не найден.")
+        return
 
     app = Application.builder().token(
         TELEGRAM_TOKEN
@@ -708,10 +759,6 @@ def main():
 
     app.add_handler(
         CommandHandler("start", start)
-    )
-
-    app.add_handler(
-        CommandHandler("help", help_command)
     )
 
     app.add_handler(
