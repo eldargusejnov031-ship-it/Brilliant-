@@ -1,592 +1,278 @@
 import os
-import json
-import time
-import threading
+import requests
 import telebot
 from telebot import types
 
-# ================= НАСТРОЙКИ =================
-
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+HF_TOKEN = os.getenv("HF_TOKEN")
+MODEL = os.getenv("MODEL", "openai/gpt-oss-120b:groq")
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN не найден")
 
+if not HF_TOKEN:
+    raise RuntimeError("HF_TOKEN не найден")
+
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 
-FILE = "data.json"
-lock = threading.Lock()
+# Память пользователей
+memory = {}
 
-# ================= БАЗА =================
-
-def load():
-    if not os.path.exists(FILE):
-        return {
-            "users": {},
-            "videos": {},
-            "tasks": {
-                "games": {
-                    "name": "Сыграй 10 раз",
-                    "reward": 30,
-                    "goal": 10
-                },
-                "wins": {
-                    "name": "Выиграй 5 раз",
-                    "reward": 50,
-                    "goal": 5
-                },
-                "messages": {
-                    "name": "Отправь 20 сообщений боту",
-                    "reward": 35,
-                    "goal": 20
-                }
-            }
-        }
-
-    try:
-        with open(FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except:
-        return {
-            "users": {},
-            "videos": {},
-            "tasks": {}
-        }
+MAX_MESSAGES = 12
 
 
-db = load()
+# =========================
+# КЛАВИАТУРЫ
+# =========================
 
-
-def save():
-    with lock:
-        with open(FILE + ".tmp", "w", encoding="utf-8") as f:
-            json.dump(db, f, ensure_ascii=False, indent=2)
-        os.replace(FILE + ".tmp", FILE)
-
-
-def user(uid, name="Игрок"):
-    uid = str(uid)
-
-    if uid not in db["users"]:
-        db["users"][uid] = {
-            "name": name,
-            "crystals": 0,
-            "games": 0,
-            "wins": 0,
-            "messages": 0,
-            "completed": [],
-            "videos": []
-        }
-        save()
-
-    db["users"][uid]["name"] = name
-    return db["users"][uid]
-
-
-def admin(uid):
-    return ADMIN_ID != 0 and int(uid) == ADMIN_ID
-
-
-# ================= МЕНЮ =================
-
-def menu(uid):
+def main_menu():
     kb = types.InlineKeyboardMarkup(row_width=2)
 
     kb.add(
-        types.InlineKeyboardButton("🎯 Задания", callback_data="tasks"),
-        types.InlineKeyboardButton("🎬 Видео", callback_data="videos")
+        types.InlineKeyboardButton("💬 Задать вопрос", callback_data="ask"),
+        types.InlineKeyboardButton("🧠 Память", callback_data="memory")
     )
 
     kb.add(
-        types.InlineKeyboardButton("🎮 Игра", callback_data="game"),
-        types.InlineKeyboardButton("💎 Баланс", callback_data="balance")
-    )
-
-    kb.add(
+        types.InlineKeyboardButton("🗑 Очистить чат", callback_data="clear"),
         types.InlineKeyboardButton("👤 Профиль", callback_data="profile")
     )
 
-    if admin(uid):
-        kb.add(
-            types.InlineKeyboardButton("👑 Админка", callback_data="admin")
-        )
+    kb.add(
+        types.InlineKeyboardButton("ℹ️ Помощь", callback_data="help")
+    )
 
     return kb
 
 
-def back():
+def back_button():
     kb = types.InlineKeyboardMarkup()
-    kb.add(types.InlineKeyboardButton("⬅️ Назад", callback_data="main"))
+    kb.add(
+        types.InlineKeyboardButton("⬅️ Главное меню", callback_data="main")
+    )
     return kb
 
 
-# ================= START =================
+# =========================
+# START
+# =========================
 
 @bot.message_handler(commands=["start"])
 def start(message):
-    u = user(
-        message.from_user.id,
-        message.from_user.first_name or "Игрок"
-    )
+    memory.setdefault(message.from_user.id, [])
 
-    u["messages"] += 1
-    save()
+    name = message.from_user.first_name or "друг"
 
     bot.send_message(
         message.chat.id,
-        f"👋 <b>Привет, {u['name']}!</b>\n\n"
-        "💎 Выполняй задания → получай кристаллы → покупай видео.\n\n"
-        "Выбирай раздел 👇",
-        reply_markup=menu(message.from_user.id)
+        f"👋 <b>Привет, {name}!</b>\n\n"
+        "🤖 Я твой ИИ-помощник.\n\n"
+        "Выбери действие ниже 👇",
+        reply_markup=main_menu()
     )
 
 
-# ================= БАЛАНС =================
+# =========================
+# КНОПКИ
+# =========================
 
-def balance_text(u):
-    return (
-        f"💎 <b>Твой баланс</b>\n\n"
-        f"💎 Кристаллы: <b>{u['crystals']}</b>"
-    )
+@bot.callback_query_handler(func=lambda call: True)
+def buttons(call):
 
-
-@bot.callback_query_handler(func=lambda c: c.data == "balance")
-def balance(call):
-    u = user(call.from_user.id, call.from_user.first_name)
-
-    bot.edit_message_text(
-        balance_text(u),
-        call.message.chat.id,
-        call.message.message_id,
-        reply_markup=back()
-    )
-
-
-# ================= ПРОФИЛЬ =================
-
-@bot.callback_query_handler(func=lambda c: c.data == "profile")
-def profile(call):
-    u = user(call.from_user.id, call.from_user.first_name)
-
-    text = (
-        f"👤 <b>{u['name']}</b>\n\n"
-        f"💎 Кристаллы: <b>{u['crystals']}</b>\n"
-        f"🎮 Игр: <b>{u['games']}</b>\n"
-        f"🏆 Побед: <b>{u['wins']}</b>\n"
-        f"🎬 Куплено видео: <b>{len(u['videos'])}</b>"
-    )
-
-    bot.edit_message_text(
-        text,
-        call.message.chat.id,
-        call.message.message_id,
-        reply_markup=back()
-    )
-
-
-# ================= ИГРА =================
-
-game_data = {}
-
-
-@bot.callback_query_handler(func=lambda c: c.data == "game")
-def game(call):
-    kb = types.InlineKeyboardMarkup(row_width=2)
-
-    kb.add(
-        types.InlineKeyboardButton("1", callback_data="answer_1"),
-        types.InlineKeyboardButton("2", callback_data="answer_2"),
-        types.InlineKeyboardButton("3", callback_data="answer_3"),
-        types.InlineKeyboardButton("4", callback_data="answer_4")
-    )
-
-    game_data[call.from_user.id] = 3
-
-    bot.edit_message_text(
-        "🎮 <b>Мини-викторина</b>\n\n"
-        "Сколько будет 1 + 2?\n\n"
-        "Правильный ответ даст 💎 кристаллы.",
-        call.message.chat.id,
-        call.message.message_id,
-        reply_markup=kb
-    )
-
-
-@bot.callback_query_handler(func=lambda c: c.data.startswith("answer_"))
-def answer(call):
     uid = call.from_user.id
-    u = user(uid, call.from_user.first_name)
 
-    answer = int(call.data.split("_")[1])
-    correct = game_data.get(uid, 3)
+    if call.data == "main":
 
-    u["games"] += 1
-
-    if answer == correct:
-        reward = 10
-        u["wins"] += 1
-        u["crystals"] += reward
-
-        text = (
-            "🎉 <b>Правильно!</b>\n\n"
-            f"💎 +{reward} кристаллов"
-        )
-    else:
-        text = (
-            "❌ Неправильно!\n\n"
-            "Правильный ответ: <b>3</b>"
+        bot.edit_message_text(
+            "🏠 <b>Главное меню</b>\n\n"
+            "Что будем делать?",
+            call.message.chat.id,
+            call.message.message_id,
+            reply_markup=main_menu()
         )
 
-    save()
+    elif call.data == "ask":
 
-    bot.edit_message_text(
-        text,
-        call.message.chat.id,
-        call.message.message_id,
-        reply_markup=back()
-    )
-
-
-# ================= ЗАДАНИЯ =================
-
-@bot.callback_query_handler(func=lambda c: c.data == "tasks")
-def tasks(call):
-    uid = str(call.from_user.id)
-    u = user(call.from_user.id, call.from_user.first_name)
-
-    kb = types.InlineKeyboardMarkup()
-
-    for key, task in db["tasks"].items():
-        progress = 0
-
-        if key == "games":
-            progress = u["games"]
-        elif key == "wins":
-            progress = u["wins"]
-        elif key == "messages":
-            progress = u["messages"]
-
-        done = key in u["completed"]
-
-        if done:
-            text = f"✅ {task['name']}"
-        else:
-            text = (
-                f"🎯 {task['name']} "
-                f"({min(progress, task['goal'])}/{task['goal']})"
-            )
-
-        kb.add(
-            types.InlineKeyboardButton(
-                text,
-                callback_data=f"task_{key}"
-            )
+        bot.edit_message_text(
+            "💬 <b>Задай мне вопрос</b>\n\n"
+            "Просто напиши сообщение следующим сообщением.",
+            call.message.chat.id,
+            call.message.message_id,
+            reply_markup=back_button()
         )
 
-    kb.add(
-        types.InlineKeyboardButton("⬅️ Назад", callback_data="main")
-    )
+    elif call.data == "memory":
 
-    bot.edit_message_text(
-        "🎯 <b>Задания</b>\n\n"
-        "Выполняй задания и получай кристаллы.",
-        call.message.chat.id,
-        call.message.message_id,
-        reply_markup=kb
-    )
+        count = len(memory.get(uid, [])) // 2
 
-
-@bot.callback_query_handler(func=lambda c: c.data.startswith("task_"))
-def task_claim(call):
-    key = call.data[5:]
-    u = user(call.from_user.id, call.from_user.first_name)
-
-    if key not in db["tasks"]:
-        return
-
-    task = db["tasks"][key]
-
-    if key == "games":
-        progress = u["games"]
-    elif key == "wins":
-        progress = u["wins"]
-    elif key == "messages":
-        progress = u["messages"]
-    else:
-        progress = 0
-
-    if key in u["completed"]:
-        text = "✅ Это задание уже выполнено."
-    elif progress < task["goal"]:
-        text = (
-            f"❌ Пока не выполнено.\n\n"
-            f"Прогресс: {progress}/{task['goal']}"
-        )
-    else:
-        u["completed"].append(key)
-        u["crystals"] += task["reward"]
-        save()
-
-        text = (
-            "🎉 <b>Задание выполнено!</b>\n\n"
-            f"💎 +{task['reward']} кристаллов"
+        bot.edit_message_text(
+            "🧠 <b>Память</b>\n\n"
+            f"Сообщений в памяти: <b>{count}</b>\n\n"
+            "ИИ использует предыдущие сообщения "
+            "этого диалога для контекста.",
+            call.message.chat.id,
+            call.message.message_id,
+            reply_markup=back_button()
         )
 
-    bot.edit_message_text(
-        text,
-        call.message.chat.id,
-        call.message.message_id,
-        reply_markup=back()
-    )
+    elif call.data == "clear":
 
+        memory[uid] = []
 
-# ================= МАГАЗИН ВИДЕО =================
-
-@bot.callback_query_handler(func=lambda c: c.data == "videos")
-def videos(call):
-    kb = types.InlineKeyboardMarkup()
-
-    if not db["videos"]:
-        text = (
-            "🎬 <b>Магазин видео</b>\n\n"
-            "Пока видео нет."
-        )
-    else:
-        text = "🎬 <b>Магазин видео</b>\n\n"
-
-        for vid, data in db["videos"].items():
-            kb.add(
-                types.InlineKeyboardButton(
-                    f"🎬 {data['title']} — 💎 {data['price']}",
-                    callback_data=f"video_{vid}"
-                )
-            )
-
-    kb.add(
-        types.InlineKeyboardButton(
-            "⬅️ Назад",
-            callback_data="main"
-        )
-    )
-
-    bot.edit_message_text(
-        text,
-        call.message.chat.id,
-        call.message.message_id,
-        reply_markup=kb
-    )
-
-
-@bot.callback_query_handler(func=lambda c: c.data.startswith("video_"))
-def video(call):
-    vid = call.data[6:]
-
-    if vid not in db["videos"]:
-        return
-
-    u = user(call.from_user.id, call.from_user.first_name)
-    v = db["videos"][vid]
-
-    if vid in u["videos"]:
-        text = (
-            f"🎬 <b>{v['title']}</b>\n\n"
-            f"🔗 {v['url']}"
+        bot.edit_message_text(
+            "🗑 <b>Память очищена!</b>\n\n"
+            "Начинаем разговор с чистого листа.",
+            call.message.chat.id,
+            call.message.message_id,
+            reply_markup=back_button()
         )
 
-    elif u["crystals"] < v["price"]:
-        text = (
-            f"🎬 <b>{v['title']}</b>\n\n"
-            f"💎 Цена: {v['price']}\n"
-            f"💎 У тебя: {u['crystals']}\n\n"
-            "❌ Недостаточно кристаллов."
+    elif call.data == "profile":
+
+        count = len(memory.get(uid, [])) // 2
+
+        bot.edit_message_text(
+            "👤 <b>Профиль</b>\n\n"
+            f"🆔 ID: <code>{uid}</code>\n"
+            f"🧠 Сообщений: <b>{count}</b>",
+            call.message.chat.id,
+            call.message.message_id,
+            reply_markup=back_button()
         )
 
-    else:
-        u["crystals"] -= v["price"]
-        u["videos"].append(vid)
-        save()
+    elif call.data == "help":
 
-        text = (
-            "🎉 <b>Видео куплено!</b>\n\n"
-            f"🎬 {v['title']}\n"
-            f"🔗 {v['url']}\n\n"
-            f"💎 Осталось: {u['crystals']}"
+        bot.edit_message_text(
+            "ℹ️ <b>Помощь</b>\n\n"
+            "💬 <b>Задать вопрос</b> — поговорить с ИИ\n"
+            "🧠 <b>Память</b> — посмотреть контекст\n"
+            "🗑 <b>Очистить чат</b> — начать заново\n"
+            "👤 <b>Профиль</b> — посмотреть свой ID",
+            call.message.chat.id,
+            call.message.message_id,
+            reply_markup=back_button()
         )
-
-    bot.edit_message_text(
-        text,
-        call.message.chat.id,
-        call.message.message_id,
-        reply_markup=back()
-    )
-
-
-# ================= АДМИНКА =================
-
-@bot.callback_query_handler(func=lambda c: c.data == "admin")
-def admin_panel(call):
-    if not admin(call.from_user.id):
-        return
-
-    kb = types.InlineKeyboardMarkup()
-
-    kb.add(
-        types.InlineKeyboardButton(
-            "➕ Добавить видео",
-            callback_data="admin_add"
-        )
-    )
-
-    kb.add(
-        types.InlineKeyboardButton(
-            "📊 Статистика",
-            callback_data="admin_stats"
-        )
-    )
-
-    kb.add(
-        types.InlineKeyboardButton(
-            "⬅️ Назад",
-            callback_data="main"
-        )
-    )
-
-    bot.edit_message_text(
-        "👑 <b>Админ-панель</b>",
-        call.message.chat.id,
-        call.message.message_id,
-        reply_markup=kb
-    )
-
-
-# ================= ДОБАВЛЕНИЕ ВИДЕО =================
-
-waiting_video = set()
-
-
-@bot.callback_query_handler(func=lambda c: c.data == "admin_add")
-def admin_add(call):
-    if not admin(call.from_user.id):
-        return
-
-    waiting_video.add(call.from_user.id)
-
-    bot.send_message(
-        call.message.chat.id,
-        "➕ <b>Добавление видео</b>\n\n"
-        "Отправь одной строкой:\n\n"
-        "<code>Название | Цена | Ссылка</code>\n\n"
-        "Пример:\n"
-        "<code>Мой ролик | 100 | https://example.com/video</code>"
-    )
-
-
-@bot.message_handler(func=lambda m: m.from_user.id in waiting_video)
-def add_video(message):
-    if not admin(message.from_user.id):
-        return
-
-    parts = [x.strip() for x in message.text.split("|")]
-
-    if len(parts) != 3:
-        bot.reply_to(
-            message,
-            "❌ Формат:\n"
-            "<code>Название | Цена | Ссылка</code>"
-        )
-        return
-
-    title, price, url = parts
 
     try:
-        price = int(price)
+        bot.answer_callback_query(call.id)
     except:
-        bot.reply_to(message, "❌ Цена должна быть числом.")
-        return
+        pass
 
-    vid = str(int(time.time()))
 
-    db["videos"][vid] = {
-        "title": title,
-        "price": price,
-        "url": url
+# =========================
+# HF AI
+# =========================
+
+def ask_ai(uid, text):
+
+    if uid not in memory:
+        memory[uid] = []
+
+    memory[uid].append({
+        "role": "user",
+        "content": text
+    })
+
+    # Ограничиваем память
+    memory[uid] = memory[uid][-MAX_MESSAGES:]
+
+    headers = {
+        "Authorization": f"Bearer {HF_TOKEN}",
+        "Content-Type": "application/json"
     }
 
-    waiting_video.discard(message.from_user.id)
-    save()
+    data = {
+        "model": MODEL,
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "Ты полезный русскоязычный Telegram AI-помощник. "
+                    "Отвечай понятно, дружелюбно и по делу."
+                )
+            }
+        ] + memory[uid],
+        "temperature": 0.7,
+        "max_tokens": 1000
+    }
 
-    bot.reply_to(
-        message,
-        f"✅ Видео добавлено!\n\n"
-        f"🎬 {title}\n"
-        f"💎 Цена: {price}"
+    response = requests.post(
+        "https://router.huggingface.co/v1/chat/completions",
+        headers=headers,
+        json=data,
+        timeout=120
     )
 
+    if response.status_code != 200:
+        print("HF ERROR:", response.status_code)
+        print(response.text)
+        return "❌ Не удалось получить ответ от ИИ."
 
-# ================= СТАТИСТИКА АДМИНА =================
+    result = response.json()
 
-@bot.callback_query_handler(func=lambda c: c.data == "admin_stats")
-def admin_stats(call):
-    if not admin(call.from_user.id):
+    answer = result["choices"][0]["message"]["content"]
+
+    memory[uid].append({
+        "role": "assistant",
+        "content": answer
+    })
+
+    memory[uid] = memory[uid][-MAX_MESSAGES:]
+
+    return answer
+
+
+# =========================
+# СООБЩЕНИЯ
+# =========================
+
+@bot.message_handler(func=lambda message: True)
+def message_handler(message):
+
+    text = message.text.strip()
+
+    if not text:
         return
 
-    users = len(db["users"])
-    videos = len(db["videos"])
+    uid = message.from_user.id
 
-    crystals = sum(
-        u["crystals"]
-        for u in db["users"].values()
-    )
-
-    bot.edit_message_text(
-        "📊 <b>Статистика</b>\n\n"
-        f"👥 Пользователей: <b>{users}</b>\n"
-        f"🎬 Видео: <b>{videos}</b>\n"
-        f"💎 Кристаллов у игроков: <b>{crystals}</b>",
-        call.message.chat.id,
-        call.message.message_id,
-        reply_markup=back()
-    )
-
-
-# ================= ГЛАВНОЕ МЕНЮ =================
-
-@bot.callback_query_handler(func=lambda c: c.data == "main")
-def main(call):
-    bot.edit_message_text(
-        "🏠 <b>Главное меню</b>\n\n"
-        "Выбирай раздел 👇",
-        call.message.chat.id,
-        call.message.message_id,
-        reply_markup=menu(call.from_user.id)
-    )
-
-
-# ================= СООБЩЕНИЯ =================
-
-@bot.message_handler(func=lambda m: True)
-def messages(message):
-    u = user(
-        message.from_user.id,
-        message.from_user.first_name
-    )
-
-    u["messages"] += 1
-    save()
-
-    bot.send_message(
+    bot.send_chat_action(
         message.chat.id,
-        "Используй /start 👆"
+        "typing"
     )
 
+    try:
+        answer = ask_ai(uid, text)
 
-# ================= ЗАПУСК =================
+        bot.send_message(
+            message.chat.id,
+            answer,
+            reply_markup=main_menu()
+        )
 
-print("BOT STARTED")
+    except requests.Timeout:
+        bot.send_message(
+            message.chat.id,
+            "⏳ ИИ отвечает слишком долго. Попробуй ещё раз."
+        )
+
+    except Exception as e:
+        print("ERROR:", e)
+
+        bot.send_message(
+            message.chat.id,
+            "❌ Произошла ошибка при обращении к ИИ."
+        )
+
+
+# =========================
+# ЗАПУСК
+# =========================
+
+print("🤖 BOT STARTED")
 
 bot.infinity_polling(
     skip_pending=True,
     timeout=30,
     long_polling_timeout=30
-)
+    )
