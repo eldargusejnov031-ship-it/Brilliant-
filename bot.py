@@ -2,11 +2,11 @@ import os
 import random
 import ast
 import operator
+import requests
 from collections import defaultdict
 
 import telebot
 from telebot import types
-from openai import OpenAI
 
 
 # =========================================================
@@ -14,17 +14,20 @@ from openai import OpenAI
 # =========================================================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-OPENAI_TOKEN = os.getenv("OPENAI_TOKEN")
+HF_TOKEN = os.getenv("HF_TOKEN")
+
+HF_URL = "https://router.huggingface.co/v1/chat/completions"
+HF_MODEL = "openai/gpt-oss-120b:groq"
+
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN не найден")
 
-if not OPENAI_TOKEN:
-    raise RuntimeError("OPENAI_TOKEN не найден")
+if not HF_TOKEN:
+    raise RuntimeError("HF_TOKEN не найден")
 
 
 bot = telebot.TeleBot(BOT_TOKEN)
-ai = OpenAI(api_key=OPENAI_TOKEN)
 
 
 # =========================================================
@@ -35,25 +38,27 @@ user_history = defaultdict(list)
 
 MAX_HISTORY = 12
 
-
 SYSTEM_PROMPT = """
-Ты полезный Telegram ИИ-помощник.
+Ты дружелюбный ИИ-помощник в Telegram.
 
 Отвечай на русском языке, если пользователь не попросил другой язык.
-Отвечай понятно и дружелюбно.
+Отвечай понятно, кратко и по делу.
+Если пользователь просит написать код, предоставляй рабочий код.
 Не придумывай факты.
-Если пользователь просит код — давай рабочий код.
 """
 
 
 # =========================================================
-# 🏆 СТАТИСТИКА
+# 📊 СТАТИСТИКА
 # =========================================================
 
 users = {}
 
+
 def get_user(user_id):
+
     if user_id not in users:
+
         users[user_id] = {
             "messages": 0,
             "games": 0,
@@ -115,7 +120,7 @@ def ai_menu():
 
     kb.add(
         types.InlineKeyboardButton(
-            "🏠 Меню",
+            "🏠 Главное меню",
             callback_data="home"
         )
     )
@@ -162,7 +167,7 @@ def tools_menu():
 
     kb.add(
         types.InlineKeyboardButton(
-            "🏠 Меню",
+            "🏠 Главное меню",
             callback_data="home"
         )
     )
@@ -187,14 +192,22 @@ def games_menu():
 
     kb.add(
         types.InlineKeyboardButton(
-            "🪨 Камень 🗞 Ножницы",
-            callback_data="game_rps"
+            "🪨 Камень",
+            callback_data="rps_rock"
+        ),
+        types.InlineKeyboardButton(
+            "📄 Бумага",
+            callback_data="rps_paper"
+        ),
+        types.InlineKeyboardButton(
+            "✂️ Ножницы",
+            callback_data="rps_scissors"
         )
     )
 
     kb.add(
         types.InlineKeyboardButton(
-            "🏠 Меню",
+            "🏠 Главное меню",
             callback_data="home"
         )
     )
@@ -226,7 +239,7 @@ def rust_menu():
 
     kb.add(
         types.InlineKeyboardButton(
-            "🏠 Меню",
+            "🏠 Главное меню",
             callback_data="home"
         )
     )
@@ -251,7 +264,7 @@ def settings_menu():
 
     kb.add(
         types.InlineKeyboardButton(
-            "🏠 Меню",
+            "🏠 Главное меню",
             callback_data="home"
         )
     )
@@ -260,7 +273,7 @@ def settings_menu():
 
 
 # =========================================================
-# 🤖 ЗАПРОС К ИИ
+# 🤖 ЗАПРОС К HUGGING FACE
 # =========================================================
 
 def ask_ai(user_id, text):
@@ -281,14 +294,32 @@ def ask_ai(user_id, text):
         "content": text
     })
 
-    response = ai.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=messages,
-        temperature=0.7,
-        max_tokens=1500
+    response = requests.post(
+        HF_URL,
+        headers={
+            "Authorization": f"Bearer {HF_TOKEN}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "model": HF_MODEL,
+            "messages": messages,
+            "max_tokens": 1500,
+            "temperature": 0.7,
+        },
+        timeout=90,
     )
 
-    answer = response.choices[0].message.content
+    if response.status_code != 200:
+        print("HF ERROR:", response.status_code)
+        print(response.text)
+
+        raise Exception(
+            f"Hugging Face error: {response.status_code}"
+        )
+
+    data = response.json()
+
+    answer = data["choices"][0]["message"]["content"]
 
     history.append({
         "role": "user",
@@ -322,9 +353,10 @@ OPERATORS = {
 
 def safe_calculate(expression):
 
-    def calc(node):
+    def calculate_node(node):
 
         if isinstance(node, ast.Constant):
+
             if isinstance(node.value, (int, float)):
                 return node.value
 
@@ -332,19 +364,23 @@ def safe_calculate(expression):
 
         if isinstance(node, ast.BinOp):
 
-            op = OPERATORS.get(type(node.op))
+            operation = OPERATORS.get(
+                type(node.op)
+            )
 
-            if not op:
+            if operation is None:
                 raise ValueError()
 
-            return op(
-                calc(node.left),
-                calc(node.right)
+            return operation(
+                calculate_node(node.left),
+                calculate_node(node.right)
             )
 
         if isinstance(node, ast.UnaryOp):
 
-            value = calc(node.operand)
+            value = calculate_node(
+                node.operand
+            )
 
             if isinstance(node.op, ast.USub):
                 return -value
@@ -359,7 +395,7 @@ def safe_calculate(expression):
         mode="eval"
     )
 
-    return calc(tree.body)
+    return calculate_node(tree.body)
 
 
 # =========================================================
@@ -369,30 +405,42 @@ def safe_calculate(expression):
 @bot.message_handler(commands=["start"])
 def start(message):
 
-    user = get_user(message.from_user.id)
+    get_user(
+        message.from_user.id
+    )
 
     bot.send_message(
         message.chat.id,
-        f"👋 Привет, {message.from_user.first_name}!\n\n"
-        "🤖 Это многофункциональный бот.\n\n"
-        "Выбирай раздел 👇",
+
+        "👋 Привет, "
+        + message.from_user.first_name
+        + "!\n\n"
+        "🤖 Добро пожаловать в моего "
+        "многофункционального бота!\n\n"
+        "Выбирай раздел ниже 👇",
+
         reply_markup=main_menu()
     )
 
 
 # =========================================================
-# 🤖 КНОПКА ИИ
+# 🤖 ИИ
 # =========================================================
 
 @bot.message_handler(
-    func=lambda m: m.text == "🤖 ИИ"
+    func=lambda message:
+        message.text == "🤖 ИИ"
 )
 def ai_button(message):
 
     bot.send_message(
         message.chat.id,
-        "🤖 Раздел ИИ\n\n"
-        "Выбери действие:",
+
+        "🤖 ИИ-ПОМОЩНИК\n\n"
+        "Ты можешь просто написать мне "
+        "сообщение.\n\n"
+        "Я постараюсь помочь 👇",
+
         reply_markup=ai_menu()
     )
 
@@ -402,14 +450,17 @@ def ai_button(message):
 # =========================================================
 
 @bot.message_handler(
-    func=lambda m: m.text == "🎮 Игры"
+    func=lambda message:
+        message.text == "🎮 Игры"
 )
 def games_button(message):
 
     bot.send_message(
         message.chat.id,
+
         "🎮 ИГРЫ\n\n"
-        "Выбирай:",
+        "Выбирай игру:",
+
         reply_markup=games_menu()
     )
 
@@ -419,13 +470,17 @@ def games_button(message):
 # =========================================================
 
 @bot.message_handler(
-    func=lambda m: m.text == "📝 Инструменты"
+    func=lambda message:
+        message.text == "📝 Инструменты"
 )
 def tools_button(message):
 
     bot.send_message(
         message.chat.id,
-        "📝 ИНСТРУМЕНТЫ",
+
+        "📝 ИНСТРУМЕНТЫ\n\n"
+        "Выбери нужный инструмент:",
+
         reply_markup=tools_menu()
     )
 
@@ -435,7 +490,8 @@ def tools_button(message):
 # =========================================================
 
 @bot.message_handler(
-    func=lambda m: m.text == "📊 Профиль"
+    func=lambda message:
+        message.text == "📊 Профиль"
 )
 def profile_button(message):
 
@@ -445,11 +501,20 @@ def profile_button(message):
 
     bot.send_message(
         message.chat.id,
+
         "👤 ТВОЙ ПРОФИЛЬ\n\n"
-        f"🆔 ID: {message.from_user.id}\n"
-        f"💬 Сообщений: {user['messages']}\n"
-        f"🎮 Игр: {user['games']}\n"
-        f"🏆 Очков: {user['points']}",
+
+        f"🆔 ID: {message.from_user.id}\n\n"
+
+        f"💬 Сообщений: "
+        f"{user['messages']}\n"
+
+        f"🎮 Игр сыграно: "
+        f"{user['games']}\n"
+
+        f"🏆 Очков: "
+        f"{user['points']}",
+
         reply_markup=main_menu()
     )
 
@@ -459,14 +524,17 @@ def profile_button(message):
 # =========================================================
 
 @bot.message_handler(
-    func=lambda m: m.text == "🔥 Rust"
+    func=lambda message:
+        message.text == "🔥 Rust"
 )
 def rust_button(message):
 
     bot.send_message(
         message.chat.id,
+
         "🔥 RUST\n\n"
-        "Выбери раздел:",
+        "Выбирай раздел:",
+
         reply_markup=rust_menu()
     )
 
@@ -476,13 +544,17 @@ def rust_button(message):
 # =========================================================
 
 @bot.message_handler(
-    func=lambda m: m.text == "⚙️ Настройки"
+    func=lambda message:
+        message.text == "⚙️ Настройки"
 )
 def settings_button(message):
 
     bot.send_message(
         message.chat.id,
-        "⚙️ НАСТРОЙКИ",
+
+        "⚙️ НАСТРОЙКИ\n\n"
+        "Здесь можно управлять памятью ИИ.",
+
         reply_markup=settings_menu()
     )
 
@@ -499,36 +571,53 @@ def callbacks(call):
     data = call.data
     user_id = call.from_user.id
 
-    # HOME
-    if data == "home":
+    try:
 
-        bot.edit_message_text(
-            "🏠 ГЛАВНОЕ МЕНЮ",
-            call.message.chat.id,
-            call.message.message_id
+        bot.answer_callback_query(
+            call.id
         )
+
+    except Exception:
+        pass
+
+
+    # -----------------------------------------------------
+    # 🏠 HOME
+    # -----------------------------------------------------
+
+    if data == "home":
 
         bot.send_message(
             call.message.chat.id,
-            "Выбирай раздел 👇",
+
+            "🏠 Главное меню:",
+
             reply_markup=main_menu()
         )
 
         return
 
 
-    # AI
+    # -----------------------------------------------------
+    # 🤖 AI CHAT
+    # -----------------------------------------------------
+
     if data == "ai_chat":
 
         bot.send_message(
             call.message.chat.id,
-            "🤖 Напиши свой вопрос:"
+
+            "🤖 Напиши свой вопрос.\n\n"
+            "Я отвечу через Hugging Face."
         )
 
         return
 
 
-    # CLEAR MEMORY
+    # -----------------------------------------------------
+    # 🧹 CLEAR MEMORY
+    # -----------------------------------------------------
+
     if data == "ai_clear":
 
         user_history[user_id].clear()
@@ -542,55 +631,76 @@ def callbacks(call):
         return
 
 
-    # SUMMARY
+    # -----------------------------------------------------
+    # 📝 SUMMARY
+    # -----------------------------------------------------
+
     if data == "tool_summary":
 
         bot.send_message(
             call.message.chat.id,
-            "📝 Отправь текст, который нужно сократить."
+
+            "📝 Сокращение текста\n\n"
+            "Отправь текст следующим сообщением."
         )
 
         return
 
 
-    # TRANSLATE
+    # -----------------------------------------------------
+    # 🌐 TRANSLATE
+    # -----------------------------------------------------
+
     if data == "tool_translate":
 
         bot.send_message(
             call.message.chat.id,
-            "🌐 Напиши текст и язык перевода.\n\n"
-            "Например:\n"
-            "Переведи на английский: Привет!"
+
+            "🌐 Переводчик\n\n"
+            "Напиши, например:\n\n"
+            "Переведи на английский:\n"
+            "Привет, как дела?"
         )
 
         return
 
 
-    # IDEA
+    # -----------------------------------------------------
+    # 💡 IDEA
+    # -----------------------------------------------------
+
     if data == "tool_idea":
 
         try:
 
             answer = ask_ai(
                 user_id,
-                "Придумай одну интересную идею."
+                "Придумай одну интересную и необычную идею."
             )
 
             bot.send_message(
                 call.message.chat.id,
-                "💡 ИДЕЯ\n\n" + answer
+
+                "💡 ИДЕЯ\n\n"
+                + answer
             )
 
-        except Exception:
+        except Exception as error:
+
+            print(error)
+
             bot.send_message(
                 call.message.chat.id,
-                "❌ Не удалось получить идею."
+                "❌ ИИ временно недоступен."
             )
 
         return
 
 
-    # JOKE
+    # -----------------------------------------------------
+    # 😂 JOKE
+    # -----------------------------------------------------
+
     if data == "tool_joke":
 
         try:
@@ -602,85 +712,73 @@ def callbacks(call):
 
             bot.send_message(
                 call.message.chat.id,
-                "😂 ШУТКА\n\n" + answer
+
+                "😂 ШУТКА\n\n"
+                + answer
             )
 
-        except Exception:
+        except Exception as error:
+
+            print(error)
+
             bot.send_message(
                 call.message.chat.id,
-                "❌ Не удалось придумать шутку."
+                "❌ ИИ временно недоступен."
             )
 
         return
 
 
-    # CALCULATOR
+    # -----------------------------------------------------
+    # 🧮 CALCULATOR
+    # -----------------------------------------------------
+
     if data == "calculator":
 
         bot.send_message(
             call.message.chat.id,
-            "🧮 Отправь математический пример.\n\n"
+
+            "🧮 КАЛЬКУЛЯТОР\n\n"
+            "Напиши пример.\n\n"
             "Например:\n"
-            "25 * 4 + 10"
+            "250 * 4 + 100"
         )
 
         return
 
 
-    # NUMBER GAME
+    # -----------------------------------------------------
+    # 🎲 NUMBER GAME
+    # -----------------------------------------------------
+
     if data == "game_number":
 
-        number = random.randint(1, 10)
-
-        bot.send_message(
-            call.message.chat.id,
-            f"🎲 Я загадал число от 1 до 10.\n\n"
-            f"Подсказка: это было **{number}** 😄",
-            parse_mode="Markdown"
-        )
-
-        get_user(user_id)["games"] += 1
-        get_user(user_id)["points"] += 1
-
-        return
-
-
-    # RPS
-    if data == "game_rps":
-
-        kb = types.InlineKeyboardMarkup()
-
-        kb.add(
-            types.InlineKeyboardButton(
-                "🪨 Камень",
-                callback_data="rps_rock"
-            ),
-            types.InlineKeyboardButton(
-                "📄 Бумага",
-                callback_data="rps_paper"
-            ),
-            types.InlineKeyboardButton(
-                "✂️ Ножницы",
-                callback_data="rps_scissors"
-            )
+        number = random.randint(
+            1,
+            10
         )
 
         bot.send_message(
             call.message.chat.id,
-            "🎮 Выбирай:",
-            reply_markup=kb
+
+            "🎲 Я загадал число от 1 до 10.\n\n"
+            "Но сегодня я добрый 😎\n"
+            f"Ответ: {number}"
         )
+
+        user = get_user(user_id)
+
+        user["games"] += 1
+        user["points"] += 1
 
         return
 
+
+    # -----------------------------------------------------
+    # 🪨📄✂️ RPS
+    # -----------------------------------------------------
 
     if data.startswith("rps_"):
-
-        choices = [
-            "rock",
-            "paper",
-            "scissors"
-        ]
 
         player = data.replace(
             "rps_",
@@ -688,7 +786,11 @@ def callbacks(call):
         )
 
         computer = random.choice(
-            choices
+            [
+                "rock",
+                "paper",
+                "scissors"
+            ]
         )
 
         names = {
@@ -698,25 +800,37 @@ def callbacks(call):
         }
 
         if player == computer:
+
             result = "🤝 Ничья!"
 
         elif (
-            (player == "rock" and computer == "scissors")
+            (player == "rock"
+             and computer == "scissors")
             or
-            (player == "paper" and computer == "rock")
+            (player == "paper"
+             and computer == "rock")
             or
-            (player == "scissors" and computer == "paper")
+            (player == "scissors"
+             and computer == "paper")
         ):
+
             result = "🏆 Ты победил!"
-            get_user(user_id)["points"] += 5
+
+            get_user(
+                user_id
+            )["points"] += 5
 
         else:
-            result = "😢 Я победил!"
 
-        get_user(user_id)["games"] += 1
+            result = "😎 Я победил!"
+
+        get_user(
+            user_id
+        )["games"] += 1
 
         bot.send_message(
             call.message.chat.id,
+
             f"Ты: {names[player]}\n"
             f"Я: {names[computer]}\n\n"
             f"{result}"
@@ -725,34 +839,45 @@ def callbacks(call):
         return
 
 
-    # RUST
+    # -----------------------------------------------------
+    # 📚 RUST GUIDE
+    # -----------------------------------------------------
+
     if data == "rust_guide":
 
         bot.send_message(
             call.message.chat.id,
+
             "📚 RUST СПРАВОЧНИК\n\n"
-            "Сюда можно добавить предметы, "
-            "ресурсы, оружие, строительство "
-            "и другую информацию."
+
+            "Этот раздел можно постепенно "
+            "заполнить предметами, ресурсами, "
+            "строительством и другой информацией."
         )
 
         return
 
 
+    # -----------------------------------------------------
+    # 🧮 RUST CALCULATOR
+    # -----------------------------------------------------
+
     if data == "rust_calc":
 
         bot.send_message(
             call.message.chat.id,
+
             "🧮 RUST КАЛЬКУЛЯТОР\n\n"
-            "Сюда можно добавить безопасный "
-            "калькулятор ресурсов и крафта."
+
+            "Здесь можно сделать калькулятор "
+            "обычных ресурсов и крафта."
         )
 
         return
 
 
 # =========================================================
-# 💬 ОБРАБОТКА ТЕКСТА
+# 💬 ОБЫЧНЫЕ СООБЩЕНИЯ
 # =========================================================
 
 @bot.message_handler(
@@ -760,7 +885,8 @@ def callbacks(call):
 )
 def text_handler(message):
 
-    text = message.text
+    text = message.text.strip()
+
     user_id = message.from_user.id
 
     user = get_user(user_id)
@@ -768,30 +894,30 @@ def text_handler(message):
     user["messages"] += 1
 
 
-    # МЕНЮ
-    if text == "🏠 Меню":
+    # -----------------------------------------------------
+    # 🧮 КАЛЬКУЛЯТОР
+    # -----------------------------------------------------
 
-        bot.send_message(
-            message.chat.id,
-            "🏠 Главное меню:",
-            reply_markup=main_menu()
-        )
-
-        return
-
-
-    # КАЛЬКУЛЯТОР
     try:
 
         if any(
             symbol in text
-            for symbol in ["+", "-", "*", "/", "%"]
+            for symbol in [
+                "+",
+                "-",
+                "*",
+                "/",
+                "%"
+            ]
         ):
 
-            result = safe_calculate(text)
+            result = safe_calculate(
+                text
+            )
 
             bot.reply_to(
                 message,
+
                 f"🧮 Ответ: {result}"
             )
 
@@ -801,7 +927,10 @@ def text_handler(message):
         pass
 
 
-    # AI
+    # -----------------------------------------------------
+    # 🤖 AI
+    # -----------------------------------------------------
+
     bot.send_chat_action(
         message.chat.id,
         "typing"
@@ -816,20 +945,21 @@ def text_handler(message):
 
         bot.reply_to(
             message,
-            answer,
-            reply_markup=main_menu()
+            answer
         )
 
     except Exception as error:
 
         print(
-            "AI ERROR:",
+            "HF ERROR:",
             error
         )
 
         bot.reply_to(
             message,
-            "❌ Ошибка при обращении к ИИ."
+
+            "❌ Не удалось получить ответ от ИИ.\n\n"
+            "Проверь HF_TOKEN и логи Render."
         )
 
 
@@ -837,8 +967,13 @@ def text_handler(message):
 # 🚀 ЗАПУСК
 # =========================================================
 
-print("🤖 Бот запускается...")
+print("================================")
+print("🤖 RUST AI BOT")
+print("🚀 Бот запускается...")
+print("🧠 Hugging Face подключён")
+print("================================")
+
 
 bot.infinity_polling(
     skip_pending=True
-    )
+            )
