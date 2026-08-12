@@ -1,68 +1,52 @@
 import os
+import time
 import random
 import sqlite3
-import time
+import threading
+
 import requests
 import telebot
 
-from telebot import types
+from flask import Flask, request
 
 
 # ============================================================
-# НАСТРОЙКИ
+# CONFIG
 # ============================================================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 HF_TOKEN = os.getenv("HF_TOKEN")
 
-HF_URL = "https://router.huggingface.co/v1/chat/completions"
-HF_MODEL = "openai/gpt-oss-120b:groq"
+PORT = int(os.getenv("PORT", "10000"))
 
 if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN не найден в Environment Variables")
+    raise RuntimeError("BOT_TOKEN не найден")
 
 if not HF_TOKEN:
-    raise RuntimeError("HF_TOKEN не найден в Environment Variables")
+    raise RuntimeError("HF_TOKEN не найден")
+
+
+# ============================================================
+# TELEGRAM
+# ============================================================
 
 bot = telebot.TeleBot(BOT_TOKEN)
 
-DB_FILE = "bot.db"
+app = Flask(__name__)
 
 
 # ============================================================
-# DATABASE
+# HUGGING FACE
 # ============================================================
 
-db = sqlite3.connect(DB_FILE, check_same_thread=False)
-cursor = db.cursor()
+HF_URL = "https://router.huggingface.co/v1/chat/completions"
 
-cursor.execute("""
-CREATE TABLE IF NOT EXISTS users (
-    user_id INTEGER PRIMARY KEY,
-    name TEXT,
-    username TEXT,
-    coins INTEGER DEFAULT 0,
-    xp INTEGER DEFAULT 0,
-    messages INTEGER DEFAULT 0,
-    last_bonus INTEGER DEFAULT 0,
-    streak INTEGER DEFAULT 0
+# Если эта модель временно недоступна,
+# можно заменить значение через Environment Variable HF_MODEL.
+HF_MODEL = os.getenv(
+    "HF_MODEL",
+    "openai/gpt-oss-120b:groq"
 )
-""")
-
-cursor.execute("""
-CREATE TABLE IF NOT EXISTS achievements (
-    user_id INTEGER,
-    achievement TEXT,
-    UNIQUE(user_id, achievement)
-)
-""")
-
-db.commit()
-
-
-# ============================================================
-# AI MEMORY
-# ============================================================
 
 ai_memory = {}
 
@@ -79,9 +63,7 @@ def ask_ai(user_id, text):
             "role": "system",
             "content": (
                 "Ты дружелюбный русскоязычный Telegram-бот. "
-                "Отвечай понятно, интересно и без лишней воды. "
-                "Если пользователь пишет на другом языке — отвечай "
-                "на этом языке."
+                "Отвечай понятно, интересно и без лишней воды."
             )
         }
     ]
@@ -102,7 +84,7 @@ def ask_ai(user_id, text):
         json={
             "model": HF_MODEL,
             "messages": messages,
-            "max_tokens": 1200,
+            "max_tokens": 1000,
             "temperature": 0.7
         },
         timeout=90
@@ -133,139 +115,40 @@ def ask_ai(user_id, text):
 
 
 # ============================================================
-# USER SYSTEM
+# DATABASE
 # ============================================================
 
-def register_user(message):
+DB_FILE = "bot.db"
 
-    user_id = message.from_user.id
+db = sqlite3.connect(
+    DB_FILE,
+    check_same_thread=False
+)
 
-    cursor.execute(
-        "SELECT user_id FROM users WHERE user_id=?",
-        (user_id,)
-    )
+cursor = db.cursor()
 
-    if cursor.fetchone() is None:
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS users (
+    user_id INTEGER PRIMARY KEY,
+    name TEXT,
+    username TEXT,
+    coins INTEGER DEFAULT 0,
+    xp INTEGER DEFAULT 0,
+    messages INTEGER DEFAULT 0,
+    last_bonus INTEGER DEFAULT 0,
+    streak INTEGER DEFAULT 0
+)
+""")
 
-        cursor.execute(
-            """
-            INSERT INTO users
-            (user_id, name, username)
-            VALUES (?, ?, ?)
-            """,
-            (
-                user_id,
-                message.from_user.first_name or "Игрок",
-                message.from_user.username or ""
-            )
-        )
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS achievements (
+    user_id INTEGER,
+    achievement TEXT,
+    UNIQUE(user_id, achievement)
+)
+""")
 
-        db.commit()
-
-
-def get_user(user_id):
-
-    cursor.execute(
-        """
-        SELECT user_id, name, username,
-               coins, xp, messages,
-               last_bonus, streak
-        FROM users
-        WHERE user_id=?
-        """,
-        (user_id,)
-    )
-
-    return cursor.fetchone()
-
-
-def add_xp(user_id, amount):
-
-    cursor.execute(
-        "UPDATE users SET xp=xp+? WHERE user_id=?",
-        (amount, user_id)
-    )
-
-    db.commit()
-
-
-def add_coins(user_id, amount):
-
-    cursor.execute(
-        "UPDATE users SET coins=coins+? WHERE user_id=?",
-        (amount, user_id)
-    )
-
-    db.commit()
-
-
-def add_message(user_id):
-
-    cursor.execute(
-        """
-        UPDATE users
-        SET messages=messages+1, xp=xp+2
-        WHERE user_id=?
-        """,
-        (user_id,)
-    )
-
-    db.commit()
-
-
-def level_from_xp(xp):
-
-    return max(1, xp // 100 + 1)
-
-
-# ============================================================
-# ACHIEVEMENTS
-# ============================================================
-
-ACHIEVEMENTS = {
-    "first_message": "🌱 Новичок",
-    "100_messages": "💬 Болтун",
-    "rust_10": "🔥 Исследователь Rust",
-    "daily_7": "🎁 Постоянный",
-}
-
-
-def give_achievement(user_id, key):
-
-    if key not in ACHIEVEMENTS:
-        return False
-
-    try:
-
-        cursor.execute(
-            """
-            INSERT INTO achievements
-            (user_id, achievement)
-            VALUES (?, ?)
-            """,
-            (user_id, key)
-        )
-
-        db.commit()
-
-        return True
-
-    except sqlite3.IntegrityError:
-        return False
-
-
-def get_achievements(user_id):
-
-    cursor.execute(
-        """
-        SELECT achievement
-        FROM achievements
-        WHERE user_id=?
-        """,
-        (user_id,)
-    )
-
-    return [x[0] for x in cursor.fetchall()]
+db.commit()
 
 
 # ============================================================
@@ -367,7 +250,146 @@ RUST_ITEMS = {
 
 
 # ============================================================
-# MAIN MENU
+# USER DATA
+# ============================================================
+
+search_mode = {}
+calc_mode = {}
+number_game = {}
+
+
+def register_user(message):
+
+    user_id = message.from_user.id
+
+    cursor.execute(
+        "SELECT user_id FROM users WHERE user_id=?",
+        (user_id,)
+    )
+
+    if cursor.fetchone() is None:
+
+        cursor.execute(
+            """
+            INSERT INTO users
+            (user_id, name, username)
+            VALUES (?, ?, ?)
+            """,
+            (
+                user_id,
+                message.from_user.first_name or "Игрок",
+                message.from_user.username or ""
+            )
+        )
+
+        db.commit()
+
+
+def get_user(user_id):
+
+    cursor.execute(
+        """
+        SELECT user_id, name, username,
+               coins, xp, messages,
+               last_bonus, streak
+        FROM users
+        WHERE user_id=?
+        """,
+        (user_id,)
+    )
+
+    return cursor.fetchone()
+
+
+def add_xp(user_id, amount):
+
+    cursor.execute(
+        "UPDATE users SET xp=xp+? WHERE user_id=?",
+        (amount, user_id)
+    )
+
+    db.commit()
+
+
+def add_coins(user_id, amount):
+
+    cursor.execute(
+        "UPDATE users SET coins=coins+? WHERE user_id=?",
+        (amount, user_id)
+    )
+
+    db.commit()
+
+
+def add_message(user_id):
+
+    cursor.execute(
+        """
+        UPDATE users
+        SET messages=messages+1,
+            xp=xp+2
+        WHERE user_id=?
+        """,
+        (user_id,)
+    )
+
+    db.commit()
+
+
+def level_from_xp(xp):
+
+    return max(1, xp // 100 + 1)
+
+
+# ============================================================
+# ACHIEVEMENTS
+# ============================================================
+
+ACHIEVEMENTS = {
+    "first_message": "🌱 Новичок",
+    "100_messages": "💬 Болтун",
+    "daily_7": "🎁 Постоянный"
+}
+
+
+def give_achievement(user_id, key):
+
+    if key not in ACHIEVEMENTS:
+        return
+
+    try:
+
+        cursor.execute(
+            """
+            INSERT INTO achievements
+            (user_id, achievement)
+            VALUES (?, ?)
+            """,
+            (user_id, key)
+        )
+
+        db.commit()
+
+    except sqlite3.IntegrityError:
+        pass
+
+
+def get_achievements(user_id):
+
+    cursor.execute(
+        """
+        SELECT achievement
+        FROM achievements
+        WHERE user_id=?
+        """,
+        (user_id,)
+    )
+
+    return [x[0] for x in cursor.fetchall()]
+
+
+# ============================================================
+# KEYBOARDS
 # ============================================================
 
 def main_menu():
@@ -398,10 +420,6 @@ def main_menu():
 
     return kb
 
-
-# ============================================================
-# RUST MENU
-# ============================================================
 
 def rust_menu():
 
@@ -457,10 +475,6 @@ def rust_menu():
     return kb
 
 
-# ============================================================
-# RUST ITEMS MENU
-# ============================================================
-
 def rust_items_menu(items=None):
 
     if items is None:
@@ -487,10 +501,6 @@ def rust_items_menu(items=None):
     return kb
 
 
-# ============================================================
-# ITEM CARD
-# ============================================================
-
 def item_text(key):
 
     item = RUST_ITEMS[key]
@@ -502,7 +512,6 @@ def item_text(key):
     )
 
     for resource, amount in item["craft"].items():
-
         text += f"• {resource}: {amount}\n"
 
     return text
@@ -519,15 +528,15 @@ def start(message):
 
     bot.send_message(
         message.chat.id,
-        "👋 Добро пожаловать!\n\n"
-        "Это большая версия моего бота.\n"
-        "Выбирай раздел 👇",
+        "👋 Привет!\n\n"
+        "🤖 RUST AI BOT\n\n"
+        "Выбирай раздел:",
         reply_markup=main_menu()
     )
 
 
 # ============================================================
-# AI
+# AI BUTTON
 # ============================================================
 
 @bot.message_handler(func=lambda m: m.text == "🤖 ИИ")
@@ -535,12 +544,13 @@ def ai_button(message):
 
     bot.send_message(
         message.chat.id,
-        "🤖 Напиши мне сообщение — отвечу через Hugging Face."
+        "🤖 Режим ИИ включён.\n\n"
+        "Просто напиши вопрос."
     )
 
 
 # ============================================================
-# RUST
+# RUST BUTTON
 # ============================================================
 
 @bot.message_handler(func=lambda m: m.text == "🔥 Rust")
@@ -570,8 +580,9 @@ def profile(message):
         message.from_user.id
     )
 
-    text = (
-        "👤 ТВОЙ ПРОФИЛЬ\n\n"
+    bot.send_message(
+        message.chat.id,
+        "👤 ПРОФИЛЬ\n\n"
         f"🧑 Имя: {user[1]}\n"
         f"⭐ Уровень: {level}\n"
         f"✨ XP: {user[4]}\n"
@@ -579,11 +590,6 @@ def profile(message):
         f"💬 Сообщений: {user[5]}\n"
         f"🔥 Серия: {user[7]} дней\n"
         f"🏆 Достижений: {len(achievements)}"
-    )
-
-    bot.send_message(
-        message.chat.id,
-        text
     )
 
 
@@ -626,11 +632,10 @@ def daily_bonus(message):
     user = get_user(user_id)
 
     now = int(time.time())
-    last_bonus = user[6]
 
-    if now - last_bonus < 86400:
+    if now - user[6] < 86400:
 
-        remaining = 86400 - (now - last_bonus)
+        remaining = 86400 - (now - user[6])
 
         hours = remaining // 3600
         minutes = (remaining % 3600) // 60
@@ -643,8 +648,8 @@ def daily_bonus(message):
 
         return
 
-    reward_coins = random.randint(50, 150)
-    reward_xp = random.randint(10, 30)
+    coins = random.randint(50, 150)
+    xp = random.randint(10, 30)
 
     streak = user[7] + 1
 
@@ -658,8 +663,8 @@ def daily_bonus(message):
         WHERE user_id=?
         """,
         (
-            reward_coins,
-            reward_xp,
+            coins,
+            xp,
             now,
             streak,
             user_id
@@ -677,8 +682,8 @@ def daily_bonus(message):
     bot.send_message(
         message.chat.id,
         "🎁 ЕЖЕДНЕВНЫЙ БОНУС\n\n"
-        f"🪙 +{reward_coins} монет\n"
-        f"⭐ +{reward_xp} XP\n"
+        f"🪙 +{coins} монет\n"
+        f"⭐ +{xp} XP\n"
         f"🔥 Серия: {streak} дней"
     )
 
@@ -701,14 +706,14 @@ def games(message):
 
     kb.add(
         types.InlineKeyboardButton(
-            "✂️ Камень / Ножницы / Бумага",
+            "✂️ Камень / Бумага / Ножницы",
             callback_data="game_rps"
         )
     )
 
     bot.send_message(
         message.chat.id,
-        "🎮 ИГРЫ\n\nВыбирай игру:",
+        "🎮 ИГРЫ",
         reply_markup=kb
     )
 
@@ -723,9 +728,9 @@ def tools(message):
     bot.send_message(
         message.chat.id,
         "🛠 ИНСТРУМЕНТЫ\n\n"
-        "🔢 Генератор случайного числа\n"
-        "🧮 Калькулятор\n"
-        "🎯 Случайный выбор"
+        "🎲 Генератор случайного числа\n"
+        "🧮 Калькулятор предметов Rust\n"
+        "🔎 Поиск по Rust"
     )
 
 
@@ -742,13 +747,6 @@ def settings(message):
         types.InlineKeyboardButton(
             "🧹 Очистить память ИИ",
             callback_data="clear_ai"
-        )
-    )
-
-    kb.add(
-        types.InlineKeyboardButton(
-            "🏠 Главное меню",
-            callback_data="home"
         )
     )
 
@@ -795,7 +793,7 @@ def callbacks(call):
 
         bot.answer_callback_query(
             call.id,
-            "Память ИИ очищена!",
+            "Память очищена!",
             show_alert=True
         )
 
@@ -814,22 +812,11 @@ def callbacks(call):
         return
 
     # ITEMS
-    if data == "rust_items":
+    if data in ("rust_items", "rust_craft"):
 
         bot.edit_message_text(
-            "📦 ВСЕ ПРЕДМЕТЫ\n\nВыбери предмет:",
-            call.message.chat.id,
-            call.message.message_id,
-            reply_markup=rust_items_menu()
-        )
-
-        return
-
-    # CRAFT
-    if data == "rust_craft":
-
-        bot.edit_message_text(
-            "🔨 КРАФТ\n\nВыбери предмет:",
+            "📦 ПРЕДМЕТЫ RUST\n\n"
+            "Выбери предмет:",
             call.message.chat.id,
             call.message.message_id,
             reply_markup=rust_items_menu()
@@ -891,7 +878,7 @@ def callbacks(call):
 
         kb.add(
             types.InlineKeyboardButton(
-                "🧮 Рассчитать количество",
+                "🧮 Посчитать крафт",
                 callback_data=f"calc_{key}"
             )
         )
@@ -921,6 +908,9 @@ def callbacks(call):
             1
         )
 
+        if key not in RUST_ITEMS:
+            return
+
         calc_mode[user_id] = key
 
         bot.send_message(
@@ -932,10 +922,10 @@ def callbacks(call):
 
         return
 
-    # GAME NUMBER
+    # NUMBER GAME
     if data == "game_number":
 
-        game_number[user_id] = random.randint(
+        number_game[user_id] = random.randint(
             1,
             10
         )
@@ -943,12 +933,12 @@ def callbacks(call):
         bot.send_message(
             call.message.chat.id,
             "🎲 Я загадал число от 1 до 10.\n"
-            "Пиши свой вариант!"
+            "Пиши вариант!"
         )
 
         return
 
-    # GAME RPS
+    # RPS
     if data == "game_rps":
 
         kb = types.InlineKeyboardMarkup()
@@ -976,7 +966,36 @@ def callbacks(call):
 
         return
 
-    # RPS
+    # RPS RESULT
     if data.startswith("rps_"):
 
-        user_cho
+        user_choice = data.replace(
+            "rps_",
+            ""
+        )
+
+        choices = [
+            "rock",
+            "paper",
+            "scissors"
+        ]
+
+        computer = random.choice(choices)
+
+        names = {
+            "rock": "🪨 Камень",
+            "paper": "📄 Бумага",
+            "scissors": "✂️ Ножницы"
+        }
+
+        if user_choice == computer:
+
+            result = "🤝 Ничья!"
+
+        elif (
+            (user_choice == "rock" and computer == "scissors")
+            or
+            (user_choice == "paper" and computer == "rock")
+            or
+            (user_choice == "scissors" and computer == "paper")
+        ):
