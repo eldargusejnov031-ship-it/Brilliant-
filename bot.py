@@ -1,14 +1,16 @@
 import os
+import random
+import sqlite3
+import time
 import requests
-from collections import defaultdict
-
 import telebot
+
 from telebot import types
 
 
-# =========================================================
-# CONFIG
-# =========================================================
+# ============================================================
+# НАСТРОЙКИ
+# ============================================================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 HF_TOKEN = os.getenv("HF_TOKEN")
@@ -17,36 +19,74 @@ HF_URL = "https://router.huggingface.co/v1/chat/completions"
 HF_MODEL = "openai/gpt-oss-120b:groq"
 
 if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN не найден")
+    raise RuntimeError("BOT_TOKEN не найден в Environment Variables")
 
 if not HF_TOKEN:
-    raise RuntimeError("HF_TOKEN не найден")
+    raise RuntimeError("HF_TOKEN не найден в Environment Variables")
 
 bot = telebot.TeleBot(BOT_TOKEN)
 
+DB_FILE = "bot.db"
 
-# =========================================================
+
+# ============================================================
+# DATABASE
+# ============================================================
+
+db = sqlite3.connect(DB_FILE, check_same_thread=False)
+cursor = db.cursor()
+
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS users (
+    user_id INTEGER PRIMARY KEY,
+    name TEXT,
+    username TEXT,
+    coins INTEGER DEFAULT 0,
+    xp INTEGER DEFAULT 0,
+    messages INTEGER DEFAULT 0,
+    last_bonus INTEGER DEFAULT 0,
+    streak INTEGER DEFAULT 0
+)
+""")
+
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS achievements (
+    user_id INTEGER,
+    achievement TEXT,
+    UNIQUE(user_id, achievement)
+)
+""")
+
+db.commit()
+
+
+# ============================================================
 # AI MEMORY
-# =========================================================
+# ============================================================
 
-history = defaultdict(list)
-MAX_HISTORY = 10
+ai_memory = {}
+
+MAX_MEMORY = 10
 
 
 def ask_ai(user_id, text):
+
+    if user_id not in ai_memory:
+        ai_memory[user_id] = []
 
     messages = [
         {
             "role": "system",
             "content": (
-                "Ты дружелюбный Telegram ИИ-помощник. "
-                "Отвечай на русском языке, если пользователь "
-                "не попросил другой язык. Отвечай понятно."
+                "Ты дружелюбный русскоязычный Telegram-бот. "
+                "Отвечай понятно, интересно и без лишней воды. "
+                "Если пользователь пишет на другом языке — отвечай "
+                "на этом языке."
             )
         }
     ]
 
-    messages.extend(history[user_id])
+    messages.extend(ai_memory[user_id])
 
     messages.append({
         "role": "user",
@@ -71,122 +111,264 @@ def ask_ai(user_id, text):
     if response.status_code != 200:
         print("HF ERROR:", response.status_code)
         print(response.text)
-        raise RuntimeError("Ошибка Hugging Face")
+        raise RuntimeError("Hugging Face API error")
 
     data = response.json()
 
     answer = data["choices"][0]["message"]["content"]
 
-    history[user_id].append({
+    ai_memory[user_id].append({
         "role": "user",
         "content": text
     })
 
-    history[user_id].append({
+    ai_memory[user_id].append({
         "role": "assistant",
         "content": answer
     })
 
-    history[user_id] = history[user_id][-MAX_HISTORY:]
+    ai_memory[user_id] = ai_memory[user_id][-MAX_MEMORY:]
 
     return answer
 
 
-# =========================================================
+# ============================================================
+# USER SYSTEM
+# ============================================================
+
+def register_user(message):
+
+    user_id = message.from_user.id
+
+    cursor.execute(
+        "SELECT user_id FROM users WHERE user_id=?",
+        (user_id,)
+    )
+
+    if cursor.fetchone() is None:
+
+        cursor.execute(
+            """
+            INSERT INTO users
+            (user_id, name, username)
+            VALUES (?, ?, ?)
+            """,
+            (
+                user_id,
+                message.from_user.first_name or "Игрок",
+                message.from_user.username or ""
+            )
+        )
+
+        db.commit()
+
+
+def get_user(user_id):
+
+    cursor.execute(
+        """
+        SELECT user_id, name, username,
+               coins, xp, messages,
+               last_bonus, streak
+        FROM users
+        WHERE user_id=?
+        """,
+        (user_id,)
+    )
+
+    return cursor.fetchone()
+
+
+def add_xp(user_id, amount):
+
+    cursor.execute(
+        "UPDATE users SET xp=xp+? WHERE user_id=?",
+        (amount, user_id)
+    )
+
+    db.commit()
+
+
+def add_coins(user_id, amount):
+
+    cursor.execute(
+        "UPDATE users SET coins=coins+? WHERE user_id=?",
+        (amount, user_id)
+    )
+
+    db.commit()
+
+
+def add_message(user_id):
+
+    cursor.execute(
+        """
+        UPDATE users
+        SET messages=messages+1, xp=xp+2
+        WHERE user_id=?
+        """,
+        (user_id,)
+    )
+
+    db.commit()
+
+
+def level_from_xp(xp):
+
+    return max(1, xp // 100 + 1)
+
+
+# ============================================================
+# ACHIEVEMENTS
+# ============================================================
+
+ACHIEVEMENTS = {
+    "first_message": "🌱 Новичок",
+    "100_messages": "💬 Болтун",
+    "rust_10": "🔥 Исследователь Rust",
+    "daily_7": "🎁 Постоянный",
+}
+
+
+def give_achievement(user_id, key):
+
+    if key not in ACHIEVEMENTS:
+        return False
+
+    try:
+
+        cursor.execute(
+            """
+            INSERT INTO achievements
+            (user_id, achievement)
+            VALUES (?, ?)
+            """,
+            (user_id, key)
+        )
+
+        db.commit()
+
+        return True
+
+    except sqlite3.IntegrityError:
+        return False
+
+
+def get_achievements(user_id):
+
+    cursor.execute(
+        """
+        SELECT achievement
+        FROM achievements
+        WHERE user_id=?
+        """,
+        (user_id,)
+    )
+
+    return [x[0] for x in cursor.fetchall()]
+
+
+# ============================================================
 # RUST DATABASE
-# =========================================================
+# ============================================================
 
 RUST_ITEMS = {
 
     "building_plan": {
         "name": "📐 План строительства",
-        "category": "🧱 Строительство",
+        "category": "Строительство",
         "craft": {
             "Дерево": 20
-        },
-        "bench": "Не требуется"
+        }
     },
 
     "campfire": {
         "name": "🔥 Костёр",
-        "category": "🏠 Постройки",
+        "category": "Постройки",
         "craft": {
             "Дерево": 100
-        },
-        "bench": "Не требуется"
+        }
     },
 
     "furnace": {
         "name": "🔥 Печь",
-        "category": "🏠 Постройки",
+        "category": "Постройки",
         "craft": {
             "Камень": 200,
             "Дерево": 100
-        },
-        "bench": "Не требуется"
+        }
     },
 
     "wood_box": {
         "name": "📦 Деревянный ящик",
-        "category": "📦 Хранение",
+        "category": "Хранение",
         "craft": {
             "Дерево": 100
-        },
-        "bench": "Не требуется"
+        }
     },
 
     "small_stash": {
         "name": "👜 Маленький тайник",
-        "category": "📦 Хранение",
+        "category": "Хранение",
         "craft": {
-            "Дерево": 10,
-            "Камень": 10
-        },
-        "bench": "Не требуется"
+            "Ткань": 10
+        }
     },
 
     "sleeping_bag": {
         "name": "🛏 Спальный мешок",
-        "category": "🏠 Постройки",
+        "category": "Постройки",
         "craft": {
             "Ткань": 30
-        },
-        "bench": "Не требуется"
+        }
     },
 
     "wooden_door": {
         "name": "🚪 Деревянная дверь",
-        "category": "🧱 Строительство",
+        "category": "Строительство",
         "craft": {
             "Дерево": 100
-        },
-        "bench": "Не требуется"
+        }
     },
 
     "lantern": {
         "name": "🏮 Фонарь",
-        "category": "💡 Освещение",
+        "category": "Освещение",
         "craft": {
             "Металлические фрагменты": 20,
             "Ткань": 10
-        },
-        "bench": "Не требуется"
+        }
     },
 
     "planter": {
         "name": "🌱 Горшок",
-        "category": "🌱 Фермерство",
+        "category": "Фермерство",
         "craft": {
             "Дерево": 100
-        },
-        "bench": "Не требуется"
+        }
+    },
+
+    "sign": {
+        "name": "🪧 Табличка",
+        "category": "Строительство",
+        "craft": {
+            "Дерево": 100
+        }
+    },
+
+    "tool_cupboard": {
+        "name": "🗄 Шкаф для инструментов",
+        "category": "Строительство",
+        "craft": {
+            "Дерево": 1000
+        }
     }
 }
 
 
-# =========================================================
+# ============================================================
 # MAIN MENU
-# =========================================================
+# ============================================================
 
 def main_menu():
 
@@ -200,20 +382,26 @@ def main_menu():
     )
 
     kb.row(
-        "📝 Инструменты",
-        "📊 Профиль"
+        "🎮 Игры",
+        "🏆 Достижения"
     )
 
     kb.row(
+        "🎁 Бонус",
+        "👤 Профиль"
+    )
+
+    kb.row(
+        "🛠 Инструменты",
         "⚙️ Настройки"
     )
 
     return kb
 
 
-# =========================================================
+# ============================================================
 # RUST MENU
-# =========================================================
+# ============================================================
 
 def rust_menu():
 
@@ -221,41 +409,9 @@ def rust_menu():
 
     kb.add(
         types.InlineKeyboardButton(
-            "📦 Все предметы",
+            "📦 Предметы",
             callback_data="rust_items"
-        )
-    )
-
-    kb.add(
-        types.InlineKeyboardButton(
-            "🧱 Строительство",
-            callback_data="cat_build"
         ),
-        types.InlineKeyboardButton(
-            "🏠 Постройки",
-            callback_data="cat_home"
-        )
-    )
-
-    kb.add(
-        types.InlineKeyboardButton(
-            "📦 Хранение",
-            callback_data="cat_storage"
-        ),
-        types.InlineKeyboardButton(
-            "🌱 Фермерство",
-            callback_data="cat_farm"
-        )
-    )
-
-    kb.add(
-        types.InlineKeyboardButton(
-            "💡 Освещение",
-            callback_data="cat_light"
-        )
-    )
-
-    kb.add(
         types.InlineKeyboardButton(
             "🔎 Поиск",
             callback_data="rust_search"
@@ -264,6 +420,35 @@ def rust_menu():
 
     kb.add(
         types.InlineKeyboardButton(
+            "🔨 Крафт",
+            callback_data="rust_craft"
+        )
+    )
+
+    kb.add(
+        types.InlineKeyboardButton(
+            "🧱 Строительство",
+            callback_data="rust_cat_Строительство"
+        ),
+        types.InlineKeyboardButton(
+            "🏠 Постройки",
+            callback_data="rust_cat_Постройки"
+        )
+    )
+
+    kb.add(
+        types.InlineKeyboardButton(
+            "📦 Хранение",
+            callback_data="rust_cat_Хранение"
+        ),
+        types.InlineKeyboardButton(
+            "🌱 Фермерство",
+            callback_data="rust_cat_Фермерство"
+        )
+    )
+
+    kb.add(
+        types.InlineKeyboardButton(
             "🏠 Главное меню",
             callback_data="home"
         )
@@ -272,26 +457,29 @@ def rust_menu():
     return kb
 
 
-# =========================================================
-# ALL ITEMS
-# =========================================================
+# ============================================================
+# RUST ITEMS MENU
+# ============================================================
 
-def items_menu():
+def rust_items_menu(items=None):
+
+    if items is None:
+        items = RUST_ITEMS.keys()
 
     kb = types.InlineKeyboardMarkup(row_width=2)
 
-    for key, item in RUST_ITEMS.items():
+    for key in items:
 
         kb.add(
             types.InlineKeyboardButton(
-                item["name"],
-                callback_data=f"item_{key}"
+                RUST_ITEMS[key]["name"],
+                callback_data=f"rust_item_{key}"
             )
         )
 
     kb.add(
         types.InlineKeyboardButton(
-            "⬅️ Назад",
+            "⬅️ Rust",
             callback_data="rust"
         )
     )
@@ -299,165 +487,261 @@ def items_menu():
     return kb
 
 
-# =========================================================
+# ============================================================
 # ITEM CARD
-# =========================================================
+# ============================================================
 
-def show_item(call, key):
+def item_text(key):
 
     item = RUST_ITEMS[key]
 
     text = (
         f"{item['name']}\n\n"
-        f"📂 {item['category']}\n\n"
-        "🔨 Крафт на 1 шт.:\n"
+        f"📂 Категория: {item['category']}\n\n"
+        "🔨 Крафт:\n"
     )
 
     for resource, amount in item["craft"].items():
 
         text += f"• {resource}: {amount}\n"
 
-    text += (
-        f"\n🏭 Верстак: {item['bench']}"
-    )
-
-    kb = types.InlineKeyboardMarkup()
-
-    kb.add(
-        types.InlineKeyboardButton(
-            "🧮 Рассчитать количество",
-            callback_data=f"amount_{key}"
-        )
-    )
-
-    kb.add(
-        types.InlineKeyboardButton(
-            "⬅️ Все предметы",
-            callback_data="rust_items"
-        )
-    )
-
-    kb.add(
-        types.InlineKeyboardButton(
-            "🏠 Rust",
-            callback_data="rust"
-        )
-    )
-
-    bot.edit_message_text(
-        text,
-        call.message.chat.id,
-        call.message.message_id,
-        reply_markup=kb
-    )
+    return text
 
 
-# =========================================================
-# TEMP USER STATES
-# =========================================================
-
-amount_waiting = {}
-search_waiting = {}
-
-
-# =========================================================
+# ============================================================
 # START
-# =========================================================
+# ============================================================
 
 @bot.message_handler(commands=["start"])
 def start(message):
 
+    register_user(message)
+
     bot.send_message(
         message.chat.id,
-        "👋 Привет!\n\n"
-        "Я твой Telegram-бот с ИИ и Rust-разделом.\n\n"
+        "👋 Добро пожаловать!\n\n"
+        "Это большая версия моего бота.\n"
         "Выбирай раздел 👇",
         reply_markup=main_menu()
     )
 
 
-# =========================================================
-# AI BUTTON
-# =========================================================
+# ============================================================
+# AI
+# ============================================================
 
-@bot.message_handler(
-    func=lambda m: m.text == "🤖 ИИ"
-)
+@bot.message_handler(func=lambda m: m.text == "🤖 ИИ")
 def ai_button(message):
 
     bot.send_message(
         message.chat.id,
-        "🤖 Напиши мне любой вопрос — "
-        "я постараюсь помочь."
+        "🤖 Напиши мне сообщение — отвечу через Hugging Face."
     )
 
 
-# =========================================================
-# RUST BUTTON
-# =========================================================
+# ============================================================
+# RUST
+# ============================================================
 
-@bot.message_handler(
-    func=lambda m: m.text == "🔥 Rust"
-)
+@bot.message_handler(func=lambda m: m.text == "🔥 Rust")
 def rust_button(message):
 
     bot.send_message(
         message.chat.id,
-        "🔥 RUST\n\n"
-        "Выбери нужный раздел:",
+        "🔥 RUST\n\nВыбери раздел:",
         reply_markup=rust_menu()
     )
 
 
-# =========================================================
-# TOOLS
-# =========================================================
-
-@bot.message_handler(
-    func=lambda m: m.text == "📝 Инструменты"
-)
-def tools_button(message):
-
-    bot.send_message(
-        message.chat.id,
-        "📝 Инструменты\n\n"
-        "Пока доступны Rust-инструменты "
-        "и ИИ."
-    )
-
-
-# =========================================================
+# ============================================================
 # PROFILE
-# =========================================================
+# ============================================================
 
-@bot.message_handler(
-    func=lambda m: m.text == "📊 Профиль"
-)
-def profile_button(message):
+@bot.message_handler(func=lambda m: m.text == "👤 Профиль")
+def profile(message):
+
+    register_user(message)
+
+    user = get_user(message.from_user.id)
+
+    level = level_from_xp(user[4])
+
+    achievements = get_achievements(
+        message.from_user.id
+    )
+
+    text = (
+        "👤 ТВОЙ ПРОФИЛЬ\n\n"
+        f"🧑 Имя: {user[1]}\n"
+        f"⭐ Уровень: {level}\n"
+        f"✨ XP: {user[4]}\n"
+        f"🪙 Монеты: {user[3]}\n"
+        f"💬 Сообщений: {user[5]}\n"
+        f"🔥 Серия: {user[7]} дней\n"
+        f"🏆 Достижений: {len(achievements)}"
+    )
 
     bot.send_message(
         message.chat.id,
-        "📊 ТВОЙ ПРОФИЛЬ\n\n"
-        f"🆔 ID: {message.from_user.id}\n"
-        f"👤 Имя: {message.from_user.first_name}"
+        text
     )
 
 
-# =========================================================
-# SETTINGS
-# =========================================================
+# ============================================================
+# ACHIEVEMENTS
+# ============================================================
 
-@bot.message_handler(
-    func=lambda m: m.text == "⚙️ Настройки"
-)
-def settings_button(message):
+@bot.message_handler(func=lambda m: m.text == "🏆 Достижения")
+def achievements(message):
+
+    keys = get_achievements(
+        message.from_user.id
+    )
+
+    text = "🏆 ДОСТИЖЕНИЯ\n\n"
+
+    for key, name in ACHIEVEMENTS.items():
+
+        if key in keys:
+            text += f"✅ {name}\n"
+        else:
+            text += f"🔒 {name}\n"
+
+    bot.send_message(
+        message.chat.id,
+        text
+    )
+
+
+# ============================================================
+# DAILY BONUS
+# ============================================================
+
+@bot.message_handler(func=lambda m: m.text == "🎁 Бонус")
+def daily_bonus(message):
+
+    register_user(message)
+
+    user_id = message.from_user.id
+    user = get_user(user_id)
+
+    now = int(time.time())
+    last_bonus = user[6]
+
+    if now - last_bonus < 86400:
+
+        remaining = 86400 - (now - last_bonus)
+
+        hours = remaining // 3600
+        minutes = (remaining % 3600) // 60
+
+        bot.send_message(
+            message.chat.id,
+            f"⏳ Бонус уже получен.\n"
+            f"Следующий через {hours}ч {minutes}мин."
+        )
+
+        return
+
+    reward_coins = random.randint(50, 150)
+    reward_xp = random.randint(10, 30)
+
+    streak = user[7] + 1
+
+    cursor.execute(
+        """
+        UPDATE users
+        SET coins=coins+?,
+            xp=xp+?,
+            last_bonus=?,
+            streak=?
+        WHERE user_id=?
+        """,
+        (
+            reward_coins,
+            reward_xp,
+            now,
+            streak,
+            user_id
+        )
+    )
+
+    db.commit()
+
+    if streak >= 7:
+        give_achievement(
+            user_id,
+            "daily_7"
+        )
+
+    bot.send_message(
+        message.chat.id,
+        "🎁 ЕЖЕДНЕВНЫЙ БОНУС\n\n"
+        f"🪙 +{reward_coins} монет\n"
+        f"⭐ +{reward_xp} XP\n"
+        f"🔥 Серия: {streak} дней"
+    )
+
+
+# ============================================================
+# GAMES
+# ============================================================
+
+@bot.message_handler(func=lambda m: m.text == "🎮 Игры")
+def games(message):
+
+    kb = types.InlineKeyboardMarkup()
+
+    kb.add(
+        types.InlineKeyboardButton(
+            "🎲 Угадай число",
+            callback_data="game_number"
+        )
+    )
+
+    kb.add(
+        types.InlineKeyboardButton(
+            "✂️ Камень / Ножницы / Бумага",
+            callback_data="game_rps"
+        )
+    )
+
+    bot.send_message(
+        message.chat.id,
+        "🎮 ИГРЫ\n\nВыбирай игру:",
+        reply_markup=kb
+    )
+
+
+# ============================================================
+# TOOLS
+# ============================================================
+
+@bot.message_handler(func=lambda m: m.text == "🛠 Инструменты")
+def tools(message):
+
+    bot.send_message(
+        message.chat.id,
+        "🛠 ИНСТРУМЕНТЫ\n\n"
+        "🔢 Генератор случайного числа\n"
+        "🧮 Калькулятор\n"
+        "🎯 Случайный выбор"
+    )
+
+
+# ============================================================
+# SETTINGS
+# ============================================================
+
+@bot.message_handler(func=lambda m: m.text == "⚙️ Настройки")
+def settings(message):
 
     kb = types.InlineKeyboardMarkup()
 
     kb.add(
         types.InlineKeyboardButton(
             "🧹 Очистить память ИИ",
-            callback_data="clear_memory"
+            callback_data="clear_ai"
         )
     )
 
@@ -470,18 +754,16 @@ def settings_button(message):
 
     bot.send_message(
         message.chat.id,
-        "⚙️ Настройки:",
+        "⚙️ НАСТРОЙКИ",
         reply_markup=kb
     )
 
 
-# =========================================================
+# ============================================================
 # CALLBACKS
-# =========================================================
+# ============================================================
 
-@bot.callback_query_handler(
-    func=lambda call: True
-)
+@bot.callback_query_handler(func=lambda call: True)
 def callbacks(call):
 
     data = call.data
@@ -489,7 +771,7 @@ def callbacks(call):
 
     try:
         bot.answer_callback_query(call.id)
-    except Exception:
+    except:
         pass
 
     # HOME
@@ -503,14 +785,17 @@ def callbacks(call):
 
         return
 
-    # CLEAR MEMORY
-    if data == "clear_memory":
+    # CLEAR AI
+    if data == "clear_ai":
 
-        history[user_id].clear()
+        ai_memory.pop(
+            user_id,
+            None
+        )
 
         bot.answer_callback_query(
             call.id,
-            "Память очищена!",
+            "Память ИИ очищена!",
             show_alert=True
         )
 
@@ -520,8 +805,7 @@ def callbacks(call):
     if data == "rust":
 
         bot.edit_message_text(
-            "🔥 RUST\n\n"
-            "Выбери нужный раздел:",
+            "🔥 RUST\n\nВыбери раздел:",
             call.message.chat.id,
             call.message.message_id,
             reply_markup=rust_menu()
@@ -529,52 +813,26 @@ def callbacks(call):
 
         return
 
-    # ALL ITEMS
+    # ITEMS
     if data == "rust_items":
 
         bot.edit_message_text(
-            "📦 ВСЕ ПРЕДМЕТЫ\n\n"
-            "Выбери предмет:",
+            "📦 ВСЕ ПРЕДМЕТЫ\n\nВыбери предмет:",
             call.message.chat.id,
             call.message.message_id,
-            reply_markup=items_menu()
+            reply_markup=rust_items_menu()
         )
 
         return
 
-    # ITEM
-    if data.startswith("item_"):
+    # CRAFT
+    if data == "rust_craft":
 
-        key = data.replace(
-            "item_",
-            "",
-            1
-        )
-
-        if key in RUST_ITEMS:
-            show_item(call, key)
-
-        return
-
-    # AMOUNT
-    if data.startswith("amount_"):
-
-        key = data.replace(
-            "amount_",
-            "",
-            1
-        )
-
-        if key not in RUST_ITEMS:
-            return
-
-        amount_waiting[user_id] = key
-
-        bot.send_message(
+        bot.edit_message_text(
+            "🔨 КРАФТ\n\nВыбери предмет:",
             call.message.chat.id,
-            f"{RUST_ITEMS[key]['name']}\n\n"
-            "🧮 Сколько штук нужно?\n\n"
-            "Напиши число, например: 10"
+            call.message.message_id,
+            reply_markup=rust_items_menu()
         )
 
         return
@@ -582,65 +840,71 @@ def callbacks(call):
     # SEARCH
     if data == "rust_search":
 
-        search_waiting[user_id] = True
+        search_mode[user_id] = True
 
         bot.send_message(
             call.message.chat.id,
-            "🔎 Напиши название предмета."
+            "🔎 Напиши название предмета:"
         )
 
         return
 
-    # CATEGORIES
-    categories = {
-        "cat_build": "🧱 Строительство",
-        "cat_home": "🏠 Постройки",
-        "cat_storage": "📦 Хранение",
-        "cat_farm": "🌱 Фермерство",
-        "cat_light": "💡 Освещение"
-    }
+    # CATEGORY
+    if data.startswith("rust_cat_"):
 
-    if data in categories:
-
-        category = categories[data]
-
-        kb = types.InlineKeyboardMarkup(
-            row_width=2
+        category = data.replace(
+            "rust_cat_",
+            "",
+            1
         )
 
-        found = False
+        found = []
 
         for key, item in RUST_ITEMS.items():
 
             if item["category"] == category:
+                found.append(key)
 
-                found = True
+        bot.edit_message_text(
+            f"📂 {category}\n\n"
+            "Выбери предмет:",
+            call.message.chat.id,
+            call.message.message_id,
+            reply_markup=rust_items_menu(found)
+        )
 
-                kb.add(
-                    types.InlineKeyboardButton(
-                        item["name"],
-                        callback_data=f"item_{key}"
-                    )
-                )
+        return
+
+    # ITEM
+    if data.startswith("rust_item_"):
+
+        key = data.replace(
+            "rust_item_",
+            "",
+            1
+        )
+
+        if key not in RUST_ITEMS:
+            return
+
+        kb = types.InlineKeyboardMarkup()
 
         kb.add(
             types.InlineKeyboardButton(
-                "⬅️ Rust",
-                callback_data="rust"
+                "🧮 Рассчитать количество",
+                callback_data=f"calc_{key}"
             )
         )
 
-        text = (
-            f"{category}\n\n"
-            "Выбери предмет:"
-            if found
-            else
-            f"{category}\n\n"
-            "Пока предметов нет."
+        kb.add(
+            types.InlineKeyboardButton(
+                "⬅️ Назад",
+                callback_data="rust_items"
+            )
         )
 
         bot.edit_message_text(
-            text,
+            item_text(key),
             call.message.chat.id,
             call.message.message_id,
             reply_markup=kb
@@ -648,156 +912,71 @@ def callbacks(call):
 
         return
 
+    # CALCULATOR
+    if data.startswith("calc_"):
 
-# =========================================================
-# TEXT HANDLER
-# =========================================================
-
-@bot.message_handler(
-    content_types=["text"]
-)
-def text_handler(message):
-
-    user_id = message.from_user.id
-    text = message.text.strip()
-
-    # SEARCH
-    if search_waiting.get(user_id):
-
-        search_waiting.pop(user_id)
-
-        query = text.lower()
-
-        results = []
-
-        for key, item in RUST_ITEMS.items():
-
-            if (
-                query in item["name"].lower()
-                or query in key.lower()
-                or query in item["category"].lower()
-            ):
-                results.append(key)
-
-        if not results:
-
-            bot.reply_to(
-                message,
-                "❌ Ничего не найдено."
-            )
-
-            return
-
-        kb = types.InlineKeyboardMarkup(
-            row_width=2
+        key = data.replace(
+            "calc_",
+            "",
+            1
         )
 
-        for key in results:
-
-            kb.add(
-                types.InlineKeyboardButton(
-                    RUST_ITEMS[key]["name"],
-                    callback_data=f"item_{key}"
-                )
-            )
+        calc_mode[user_id] = key
 
         bot.send_message(
-            message.chat.id,
-            "🔎 Результаты поиска:",
+            call.message.chat.id,
+            f"{RUST_ITEMS[key]['name']}\n\n"
+            "🧮 Сколько штук нужно?\n"
+            "Напиши число:"
+        )
+
+        return
+
+    # GAME NUMBER
+    if data == "game_number":
+
+        game_number[user_id] = random.randint(
+            1,
+            10
+        )
+
+        bot.send_message(
+            call.message.chat.id,
+            "🎲 Я загадал число от 1 до 10.\n"
+            "Пиши свой вариант!"
+        )
+
+        return
+
+    # GAME RPS
+    if data == "game_rps":
+
+        kb = types.InlineKeyboardMarkup()
+
+        kb.add(
+            types.InlineKeyboardButton(
+                "🪨 Камень",
+                callback_data="rps_rock"
+            ),
+            types.InlineKeyboardButton(
+                "📄 Бумага",
+                callback_data="rps_paper"
+            ),
+            types.InlineKeyboardButton(
+                "✂️ Ножницы",
+                callback_data="rps_scissors"
+            )
+        )
+
+        bot.send_message(
+            call.message.chat.id,
+            "🎮 Выбирай:",
             reply_markup=kb
         )
 
         return
 
-    # AMOUNT CALCULATOR
-    if user_id in amount_waiting:
+    # RPS
+    if data.startswith("rps_"):
 
-        key = amount_waiting[user_id]
-
-        try:
-            amount = int(text)
-
-            if amount <= 0:
-                raise ValueError
-
-        except ValueError:
-
-            bot.reply_to(
-                message,
-                "❌ Введи положительное число."
-            )
-
-            return
-
-        amount_waiting.pop(user_id)
-
-        item = RUST_ITEMS[key]
-
-        result = (
-            "🧮 РАСЧЁТ\n\n"
-            f"{item['name']}\n"
-            f"📦 Количество: {amount}\n\n"
-            "🔨 Нужно ресурсов:\n"
-        )
-
-        for resource, one in item["craft"].items():
-
-            total = one * amount
-
-            result += (
-                f"• {resource}: {total}\n"
-            )
-
-        result += (
-            f"\n🏭 Верстак: {item['bench']}"
-        )
-
-        bot.send_message(
-            message.chat.id,
-            result
-        )
-
-        return
-
-    # AI
-    try:
-
-        bot.send_chat_action(
-            message.chat.id,
-            "typing"
-        )
-
-        answer = ask_ai(
-            user_id,
-            text
-        )
-
-        bot.reply_to(
-            message,
-            answer
-        )
-
-    except Exception as error:
-
-        print("AI ERROR:", error)
-
-        bot.reply_to(
-            message,
-            "❌ ИИ временно недоступен. "
-            "Проверь HF_TOKEN и Logs в Render."
-        )
-
-
-# =========================================================
-# RUN
-# =========================================================
-
-print("================================")
-print("🤖 BOT STARTED")
-print("🧠 Hugging Face: OK")
-print("🔥 Rust: OK")
-print("================================")
-
-bot.infinity_polling(
-    skip_pending=True
-)
+        user_cho
